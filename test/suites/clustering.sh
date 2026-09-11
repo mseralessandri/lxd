@@ -6361,6 +6361,235 @@ test_clustering_replicator_snapshot() {
   kill_lxd "${LXD_ONE_DIR}"
 }
 
+# replicator_assert_run_status asserts the one-hot lxd_replicator_last_run_status gauge: the
+# expected status reports 1 and every other status reports 0. Every status is emitted on every
+# scrape so that a status change never leaves a stale series behind.
+replicator_assert_run_status() {
+  local metrics="${1}"
+  local project="${2}"
+  local name="${3}"
+  local expected="${4}"
+  local status value
+
+  for status in Pending Running Completed Failed; do
+    value=0
+    if [ "${status}" = "${expected}" ]; then
+      value=1
+    fi
+
+    grep -xF "lxd_replicator_last_run_status{name=\"${name}\",project=\"${project}\",status=\"${status}\"} ${value}" <<< "${metrics}"
+  done
+}
+
+# replicator_metric_value prints the value of a replicator gauge that has project and name labels.
+replicator_metric_value() {
+  local metrics="${1}"
+  local metric="${2}"
+  local project="${3}"
+  local name="${4}"
+
+  awk -v key="${metric}{name=\"${name}\",project=\"${project}\"}" '$1 == key { print $2 }' <<< "${metrics}"
+}
+
+# replicator_wait_event waits for a lifecycle monitor file to contain an event matching the given
+# jq filter, then asserts on it. The monitor writes asynchronously, so the event can land shortly
+# after the command that triggered it has returned.
+replicator_wait_event() {
+  local monfile="${1}"
+  local filter="${2}"
+  local _
+
+  for _ in $(seq 30); do
+    if jq --exit-status --slurp "${filter}" "${monfile}" > /dev/null 2>&1; then
+      break
+    fi
+
+    sleep 0.2
+  done
+
+  jq --exit-status --slurp "${filter}" "${monfile}"
+}
+
+test_clustering_replicator_metrics() {
+  # Create two standalone clustered LXD daemons to simulate two separate clusters.
+  LXD_ONE_DIR=$(mktemp -d -p "${TEST_DIR}" XXX)
+  spawn_lxd "${LXD_ONE_DIR}" true
+
+  LXD_TWO_DIR=$(mktemp -d -p "${TEST_DIR}" XXX)
+  spawn_lxd "${LXD_TWO_DIR}" true
+
+  # Enable clustering on both.
+  LXD_DIR="${LXD_ONE_DIR}" lxc cluster enable node1
+  LXD_DIR="${LXD_TWO_DIR}" lxc cluster enable node2
+
+  # Create projects on both clusters.
+  LXD_DIR="${LXD_ONE_DIR}" lxc project create replicator-project
+  LXD_DIR="${LXD_TWO_DIR}" lxc project create replicator-project
+
+  # Setup auth groups and cluster links.
+  LXD_DIR="${LXD_ONE_DIR}" lxc auth group create replicator-group
+  LXD_DIR="${LXD_ONE_DIR}" lxc auth group permission add replicator-group project replicator-project operator
+  LXD_DIR="${LXD_ONE_DIR}" lxc auth group permission add replicator-group project replicator-project can_edit
+  LXD_ONE_TRUST_TOKEN="$(LXD_DIR="${LXD_ONE_DIR}" lxc cluster link create lxd_two --quiet --auth-group replicator-group)"
+
+  LXD_DIR="${LXD_TWO_DIR}" lxc auth group create replicator-group
+  LXD_DIR="${LXD_TWO_DIR}" lxc auth group permission add replicator-group project replicator-project operator
+  LXD_DIR="${LXD_TWO_DIR}" lxc auth group permission add replicator-group project replicator-project can_edit
+  LXD_DIR="${LXD_TWO_DIR}" lxc cluster link create lxd_one --token "${LXD_ONE_TRUST_TOKEN}" --auth-group replicator-group
+
+  # Configure replica project settings: standby sets replica.cluster, leader creates replicator.
+  LXD_DIR="${LXD_TWO_DIR}" lxc project set replicator-project replica.cluster=lxd_one
+  LXD_DIR="${LXD_ONE_DIR}" lxc replicator create metrics-replicator cluster=lxd_two --project replicator-project
+  LXD_DIR="${LXD_TWO_DIR}" lxc project demote-replica replicator-project
+  LXD_DIR="${LXD_ONE_DIR}" lxc project promote-replica replicator-project
+
+  # Setup storage on both clusters.
+  local pool_one pool_two
+  pool_one="lxdtest-$(basename "${LXD_ONE_DIR}")"
+  pool_two="lxdtest-$(basename "${LXD_TWO_DIR}")"
+  LXD_DIR="${LXD_ONE_DIR}" lxc profile device add default root disk path="/" pool="${pool_one}" --project replicator-project
+  LXD_DIR="${LXD_TWO_DIR}" lxc profile device add default root disk path="/" pool="${pool_two}" --project replicator-project
+
+  local metrics success_ts snapshot_ts previous_success_ts monfile mon_pid
+
+  sub_test "Verify a replicator that has never run reports as pending"
+
+  metrics="$(LXD_DIR="${LXD_ONE_DIR}" lxc query /1.0/metrics)"
+
+  # lxd_replicators is dense: every project reports a count, including projects without any
+  # replicator, so that `lxd_replicators == 0` identifies unprotected projects.
+  grep -xF 'lxd_replicators{project="replicator-project"} 1' <<< "${metrics}"
+  grep -xF 'lxd_replicators{project="default"} 0' <<< "${metrics}"
+
+  replicator_assert_run_status "${metrics}" replicator-project metrics-replicator Pending
+
+  # A zero timestamp means no successful run has been recorded yet.
+  [ "$(replicator_metric_value "${metrics}" lxd_replicator_last_success_timestamp replicator-project metrics-replicator)" = "0" ]
+  [ "$(replicator_metric_value "${metrics}" lxd_replicator_last_success_oldest_snapshot_timestamp replicator-project metrics-replicator)" = "0" ]
+
+  sub_test "Verify the target cluster does not report the source cluster's replicator"
+
+  # The replicator only exists in the source cluster's database, so the target reports a count of
+  # zero for the project and no per-replicator series at all.
+  metrics="$(LXD_DIR="${LXD_TWO_DIR}" lxc query /1.0/metrics)"
+  grep -xF 'lxd_replicators{project="replicator-project"} 0' <<< "${metrics}"
+  if grep -F 'lxd_replicator_last_run_status{' <<< "${metrics}"; then
+    echo "ERROR: target cluster reported a replicator status it does not own" >&2
+    exit 1
+  fi
+
+  sub_test "Verify a successful run updates the metrics and emits a completion event"
+
+  LXD_DIR="${LXD_ONE_DIR}" ensure_import_testimage replicator-project
+  LXD_DIR="${LXD_ONE_DIR}" lxc launch testimage c1 --project replicator-project -d "${SMALL_ROOT_DISK}"
+
+  monfile="${TEST_DIR}/replicator-events.jsonl"
+  rm -f "${monfile}"
+  LXD_DIR="${LXD_ONE_DIR}" stdbuf -oL lxc monitor --all-projects --type=lifecycle --format=json > "${monfile}" &
+  mon_pid=$!
+  sleep 0.5
+
+  LXD_DIR="${LXD_ONE_DIR}" lxc replicator run metrics-replicator --project replicator-project
+
+  # The replicator-run event fires on completion (not when a manual run starts) and carries the
+  # outcome of the run, including the recovery point it achieved.
+  replicator_wait_event "${monfile}" \
+    'map(select(.metadata.action == "replicator-run" and .metadata.context.status == "Completed" and .metadata.context.instances_total == 1 and .metadata.context.instances_failed == 0 and .metadata.context.effective_rpo_seconds >= 0)) | length == 1'
+
+  kill_go_proc "${mon_pid}"
+
+  metrics="$(LXD_DIR="${LXD_ONE_DIR}" lxc query /1.0/metrics)"
+  replicator_assert_run_status "${metrics}" replicator-project metrics-replicator Completed
+
+  # Both timestamps are now recorded, and the recovery point cannot be newer than the run that
+  # established it.
+  success_ts="$(replicator_metric_value "${metrics}" lxd_replicator_last_success_timestamp replicator-project metrics-replicator)"
+  snapshot_ts="$(replicator_metric_value "${metrics}" lxd_replicator_last_success_oldest_snapshot_timestamp replicator-project metrics-replicator)"
+  [ "${success_ts}" != "0" ]
+  [ "${snapshot_ts}" != "0" ]
+  jq --exit-status --null-input --argjson run "${success_ts}" --argjson snap "${snapshot_ts}" '$snap <= $run'
+
+  sub_test "Verify a failed run is reported in the metrics, the event and a warning"
+
+  LXD_DIR="${LXD_ONE_DIR}" lxc warning delete --all
+
+  # Force the per-instance child operation to fail: the instance no longer exists on the target,
+  # so it has to be created there, and the project forbids creating any instance.
+  LXD_DIR="${LXD_TWO_DIR}" lxc delete c1 --project replicator-project
+  LXD_DIR="${LXD_TWO_DIR}" lxc project set replicator-project limits.instances=0
+
+  rm -f "${monfile}"
+  LXD_DIR="${LXD_ONE_DIR}" stdbuf -oL lxc monitor --all-projects --type=lifecycle --format=json > "${monfile}" &
+  mon_pid=$!
+  sleep 0.5
+
+  if LXD_DIR="${LXD_ONE_DIR}" lxc replicator run metrics-replicator --project replicator-project; then
+    echo "ERROR: replicator run unexpectedly succeeded with a failing instance" >&2
+    exit 1
+  fi
+
+  replicator_wait_event "${monfile}" \
+    'map(select(.metadata.action == "replicator-run" and .metadata.context.status == "Failed" and .metadata.context.instances_total == 1 and .metadata.context.instances_failed == 1)) | length == 1'
+
+  kill_go_proc "${mon_pid}"
+
+  metrics="$(LXD_DIR="${LXD_ONE_DIR}" lxc query /1.0/metrics)"
+  replicator_assert_run_status "${metrics}" replicator-project metrics-replicator Failed
+
+  # A failed run must not discard the recovery point recorded by the last successful run,
+  # otherwise a single failure would erase the evidence that the project was ever protected.
+  previous_success_ts="${success_ts}"
+  [ "$(replicator_metric_value "${metrics}" lxd_replicator_last_success_timestamp replicator-project metrics-replicator)" = "${previous_success_ts}" ]
+
+  # The failure is also surfaced as a warning against the replicator.
+  LXD_DIR="${LXD_ONE_DIR}" lxc query "/1.0/warnings?recursion=1&project=replicator-project" \
+    | jq --exit-status 'map(select(.type == "Replicator run failed" and .status != "resolved")) | length == 1'
+
+  sub_test "Verify a later successful run clears the failure"
+
+  LXD_DIR="${LXD_TWO_DIR}" lxc project unset replicator-project limits.instances
+  LXD_DIR="${LXD_ONE_DIR}" lxc replicator run metrics-replicator --project replicator-project
+
+  metrics="$(LXD_DIR="${LXD_ONE_DIR}" lxc query /1.0/metrics)"
+  replicator_assert_run_status "${metrics}" replicator-project metrics-replicator Completed
+
+  # The recovery point moved forward now that the run succeeded again.
+  success_ts="$(replicator_metric_value "${metrics}" lxd_replicator_last_success_timestamp replicator-project metrics-replicator)"
+  jq --exit-status --null-input --argjson new "${success_ts}" --argjson old "${previous_success_ts}" '$new >= $old'
+
+  # The warning raised by the failed run is resolved rather than left behind.
+  LXD_DIR="${LXD_ONE_DIR}" lxc query "/1.0/warnings?recursion=1&project=replicator-project" \
+    | jq --exit-status 'map(select(.type == "Replicator run failed" and .status != "resolved")) | length == 0'
+
+  sub_test "Verify a run that cannot start is recorded"
+
+  # A run that fails before any per-instance operation is scheduled (here because the target
+  # cluster is unreachable) must still be recorded. Otherwise the replicator would keep
+  # reporting the status of its last successful run while every new run silently fails.
+  LXD_DIR="${LXD_ONE_DIR}" lxc warning delete --all
+  shutdown_lxd "${LXD_TWO_DIR}"
+
+  if LXD_DIR="${LXD_ONE_DIR}" lxc replicator run metrics-replicator --project replicator-project; then
+    echo "ERROR: replicator run unexpectedly succeeded with the target cluster down" >&2
+    exit 1
+  fi
+
+  metrics="$(LXD_DIR="${LXD_ONE_DIR}" lxc query /1.0/metrics)"
+  replicator_assert_run_status "${metrics}" replicator-project metrics-replicator Failed
+
+  LXD_DIR="${LXD_ONE_DIR}" lxc query "/1.0/warnings?recursion=1&project=replicator-project" \
+    | jq --exit-status 'map(select(.type == "Replicator run failed" and .status != "resolved")) | length == 1'
+
+  respawn_lxd "${LXD_TWO_DIR}" true
+
+  # Cleanup
+  rm -f "${monfile}"
+  LXD_DIR="${LXD_TWO_DIR}" lxc profile device remove default root --project replicator-project
+  LXD_DIR="${LXD_ONE_DIR}" lxc profile device remove default root --project replicator-project
+  kill_lxd "${LXD_TWO_DIR}"
+  kill_lxd "${LXD_ONE_DIR}"
+}
+
 test_clustering_replicator_multi_member() {
   local poolDriver
   poolDriver=$(storage_backend "${LXD_INITIAL_DIR}")
@@ -6433,6 +6662,20 @@ test_clustering_replicator_multi_member() {
   # The replicator operation must report success with two child operations.
   bulk_op="$(LXD_DIR="${LXD_ONE_DIR}" lxc query -X GET '/1.0/operations?project=replicator-project&recursion=2' | jq --exit-status '[.. | objects | select(.description == "Running replicator")] | max_by(.created_at)')"
   jq --exit-status '([., (.children? // [])[]] | length) == 6 and .status == "Success" and .child_count == 5 and (all(.children[]; .status == "Success"))' <<< "${bulk_op}"
+
+  sub_test "Verify replicator metrics are reported by exactly one cluster member"
+
+  # Replicator state is global to the cluster while the metrics endpoint is scraped per member,
+  # so only the leader reports these gauges. If every member reported them, an aggregation such
+  # as sum(lxd_replicator_last_run_status) would over-count by the number of members.
+  local member_dir reporting_members=0
+  for member_dir in "${LXD_ONE_DIR}" "${LXD_TWO_DIR}"; do
+    if LXD_DIR="${member_dir}" lxc query /1.0/metrics | grep -F 'lxd_replicator_last_run_status{' > /dev/null; then
+      reporting_members=$((reporting_members + 1))
+    fi
+  done
+
+  [ "${reporting_members}" = "1" ]
 
   sub_test "Verify snapshotting works for instances on other cluster members"
 
@@ -7544,4 +7787,277 @@ test_clustering_durable_operations() {
   kill_lxd "${LXD_TWO_DIR}"
   kill_lxd "${LXD_THREE_DIR}"
   kill_lxd "${LXD_FOUR_DIR}"
+}
+
+test_clustering_replicator_volumes() {
+  # Wiring up the leader and standby cluster pair dominates the runtime, so both
+  # scenarios share a single pair that is set up once. Each scenario removes the
+  # instances and volumes it creates so the next one starts from a clean project.
+  local vol_pool
+  setup_replicator_volume_test
+
+  _clustering_replicator_volume_forward
+
+  # The restore scenario swaps the leader and standby roles, so it must run last.
+  _clustering_replicator_volume_restore
+
+  teardown_replicator_volume_test
+}
+
+_clustering_replicator_volume_forward() {
+  sub_test "Exclusively attached volume replicates inside its instance migration with the crash-consistent snapshot"
+
+  LXD_DIR="${LXD_ONE_DIR}" ensure_import_testimage replicator-project
+  LXD_DIR="${LXD_ONE_DIR}" lxc launch testimage c1 --project replicator-project -d "${SMALL_ROOT_DISK}"
+  LXD_DIR="${LXD_ONE_DIR}" lxc storage volume create "${vol_pool}" excl-vol --project replicator-project
+  LXD_DIR="${LXD_ONE_DIR}" lxc config device add c1 datadisk disk pool="${vol_pool}" source=excl-vol path=/mnt --project replicator-project
+
+  # A marker written before the run proves the volume data travels, not only the volume record. The
+  # standby cannot start the instance, so the volume is exported there and the marker read from the tarball.
+  LXD_DIR="${LXD_ONE_DIR}" lxc exec c1 --project replicator-project -- sh -c 'echo run1 > /mnt/marker'
+  LXD_DIR="${LXD_ONE_DIR}" lxc replicator run my-replicator --project replicator-project
+
+  # Both the instance and the exclusive volume must appear on the standby, with the volume
+  # attached to the replicated instance.
+  LXD_DIR="${LXD_TWO_DIR}" lxc list --project replicator-project --format csv --columns ns | grep -xF 'c1,STOPPED'
+  LXD_DIR="${LXD_TWO_DIR}" lxc query "/1.0/storage-pools/${vol_pool}/volumes/custom/excl-vol?project=replicator-project" \
+    | jq --exit-status '.name == "excl-vol" and .used_by == ["/1.0/instances/c1?project=replicator-project"]'
+  LXD_DIR="${LXD_TWO_DIR}" lxc storage volume export "${vol_pool}" excl-vol "${TEST_DIR}/excl-vol.tar.gz" --project replicator-project
+  [ "$(tar -xOf "${TEST_DIR}/excl-vol.tar.gz" backup/volume/marker)" = "run1" ]
+
+  # The instance's all-exclusive snapshot covers excl-vol, so both hold exactly one snapshot on
+  # the leader, and the volume snapshot travels with the volume so the standby holds it too.
+  LXD_DIR="${LXD_ONE_DIR}" lxc query "/1.0/instances/c1/snapshots?project=replicator-project" \
+    | jq --exit-status 'length == 1'
+  LXD_DIR="${LXD_ONE_DIR}" lxc query "/1.0/storage-pools/${vol_pool}/volumes/custom/excl-vol/snapshots?project=replicator-project" \
+    | jq --exit-status 'length == 1'
+  LXD_DIR="${LXD_TWO_DIR}" lxc query "/1.0/storage-pools/${vol_pool}/volumes/custom/excl-vol/snapshots?project=replicator-project" \
+    | jq --exit-status 'length == 1'
+
+  # The volume travels inside the instance's forward child, so the run has no volume children:
+  # one snapshot and one forward child for c1 plus the finalize child.
+  local bulk_op
+  bulk_op="$(LXD_DIR="${LXD_ONE_DIR}" lxc query --request GET '/1.0/operations?project=replicator-project&recursion=2' \
+    | jq --exit-status '[.. | objects | select(.description == "Running replicator")] | max_by(.created_at)')"
+  jq --exit-status '
+    .status == "Success"
+    and .child_count == 3
+    and (all(.children[]; .status == "Success"))
+    and ([.children[] | select(.description == "Snapshotting instance for replication")] | length) == 1
+    and ([.children[] | select(.description == "Replicating instance")] | length) == 1
+  ' <<< "${bulk_op}"
+
+  sub_test "Second run refreshes the volume and carries only the new snapshot"
+
+  LXD_DIR="${LXD_ONE_DIR}" lxc exec c1 --project replicator-project -- sh -c 'echo run2 > /mnt/marker'
+  LXD_DIR="${LXD_ONE_DIR}" lxc replicator run my-replicator --project replicator-project
+  LXD_DIR="${LXD_ONE_DIR}" lxc query "/1.0/storage-pools/${vol_pool}/volumes/custom/excl-vol/snapshots?project=replicator-project" \
+    | jq --exit-status 'length == 2'
+  LXD_DIR="${LXD_TWO_DIR}" lxc query "/1.0/storage-pools/${vol_pool}/volumes/custom/excl-vol/snapshots?project=replicator-project" \
+    | jq --exit-status 'length == 2'
+  # The refresh has to carry the changed data, not only the new snapshot.
+  LXD_DIR="${LXD_TWO_DIR}" lxc storage volume export "${vol_pool}" excl-vol "${TEST_DIR}/excl-vol.tar.gz" --project replicator-project
+  [ "$(tar -xOf "${TEST_DIR}/excl-vol.tar.gz" backup/volume/marker)" = "run2" ]
+  rm -f "${TEST_DIR}/excl-vol.tar.gz"
+
+  sub_test "Volume attached through a profile is refused until the standby profile carries the device"
+
+  LXD_DIR="${LXD_ONE_DIR}" lxc storage volume create "${vol_pool}" prof-vol --project replicator-project
+  LXD_DIR="${LXD_ONE_DIR}" lxc profile create volprofile --project replicator-project
+  LXD_DIR="${LXD_ONE_DIR}" lxc profile device add volprofile profdisk disk pool="${vol_pool}" source=prof-vol path=/prof --project replicator-project
+  LXD_DIR="${LXD_ONE_DIR}" lxc profile add c1 volprofile --project replicator-project
+  LXD_DIR="${LXD_TWO_DIR}" lxc profile create volprofile --project replicator-project
+
+  # c1 alone uses prof-vol, so it is exclusive and the leader lists it in the index header. The standby's
+  # copy of the profile has no device for it, so nothing in c1's effective config there references the
+  # volume and the migration is refused at the header, before any data moves.
+  ! LXD_DIR="${LXD_ONE_DIR}" lxc replicator run my-replicator --project replicator-project || false
+  ! LXD_DIR="${LXD_TWO_DIR}" lxc storage volume show "${vol_pool}" prof-vol --project replicator-project || false
+  bulk_op="$(LXD_DIR="${LXD_ONE_DIR}" lxc query --request GET '/1.0/operations?project=replicator-project&recursion=2' \
+    | jq --exit-status '[.. | objects | select(.description == "Running replicator")] | max_by(.created_at)')"
+  jq --exit-status '
+    [.children[] | select(.description == "Replicating instance")]
+    | length == 1 and all(.status == "Failure" and (.err | test("no device of the instance or its profiles on the target references it")))
+  ' <<< "${bulk_op}"
+
+  # A profile device validates against an existing volume, so the standby is prepared by creating the
+  # volume first and then adding the device. The run then refreshes the empty volume from the leader, with
+  # its snapshots, and c1 reaches it through the profile rather than through a leftover local device.
+  # The refused run had already taken its snapshot before the migration was turned away, and a snapshot is
+  # kept on failure because it is the leader's rollback point. So the leader holds two snapshots of prof-vol
+  # by now and the refresh carries both.
+  LXD_DIR="${LXD_TWO_DIR}" lxc storage volume create "${vol_pool}" prof-vol --project replicator-project
+  LXD_DIR="${LXD_TWO_DIR}" lxc profile device add volprofile profdisk disk pool="${vol_pool}" source=prof-vol path=/prof --project replicator-project
+  LXD_DIR="${LXD_ONE_DIR}" lxc replicator run my-replicator --project replicator-project
+  LXD_DIR="${LXD_TWO_DIR}" lxc query "/1.0/instances/c1?project=replicator-project" \
+    | jq --exit-status '.expanded_devices.profdisk.source == "prof-vol" and (.devices | has("profdisk") | not)'
+  LXD_DIR="${LXD_TWO_DIR}" lxc query "/1.0/storage-pools/${vol_pool}/volumes/custom/prof-vol?project=replicator-project" \
+    | jq --exit-status '.used_by == ["/1.0/profiles/volprofile?project=replicator-project"]'
+  LXD_DIR="${LXD_ONE_DIR}" lxc query "/1.0/storage-pools/${vol_pool}/volumes/custom/prof-vol/snapshots?project=replicator-project" \
+    | jq --exit-status 'length == 2'
+  LXD_DIR="${LXD_TWO_DIR}" lxc query "/1.0/storage-pools/${vol_pool}/volumes/custom/prof-vol/snapshots?project=replicator-project" \
+    | jq --exit-status 'length == 2'
+  replicator_info="$(LXD_DIR="${LXD_ONE_DIR}" lxc replicator info my-replicator --project replicator-project)"
+  grep -F 'prof-vol' <<< "${replicator_info}"
+
+  LXD_DIR="${LXD_ONE_DIR}" lxc profile remove c1 volprofile --project replicator-project
+  LXD_DIR="${LXD_TWO_DIR}" lxc profile remove c1 volprofile --project replicator-project
+  LXD_DIR="${LXD_ONE_DIR}" lxc profile delete volprofile --project replicator-project
+  LXD_DIR="${LXD_TWO_DIR}" lxc profile delete volprofile --project replicator-project
+  LXD_DIR="${LXD_ONE_DIR}" lxc storage volume delete "${vol_pool}" prof-vol --project replicator-project
+  LXD_DIR="${LXD_TWO_DIR}" lxc storage volume delete "${vol_pool}" prof-vol --project replicator-project
+
+  sub_test "Shared volume missing on the standby fails the instance before any data moves"
+
+  LXD_DIR="${LXD_ONE_DIR}" lxc init --empty c2 --project replicator-project -d "${SMALL_ROOT_DISK}"
+  LXD_DIR="${LXD_ONE_DIR}" lxc storage volume create "${vol_pool}" shared-vol --project replicator-project
+  LXD_DIR="${LXD_ONE_DIR}" lxc config device add c1 shareddisk disk pool="${vol_pool}" source=shared-vol path=/share --project replicator-project
+  LXD_DIR="${LXD_ONE_DIR}" lxc config device add c2 shareddisk disk pool="${vol_pool}" source=shared-vol path=/share --project replicator-project
+
+  # The standby defers the shared device as if the volume were exclusive, then finds it absent from the
+  # source's index header and refuses both instances before their root disks are sent: c2 is never
+  # created there and the c1 copy keeps its previous devices.
+  ! LXD_DIR="${LXD_ONE_DIR}" lxc replicator run my-replicator --project replicator-project || false
+  ! LXD_DIR="${LXD_TWO_DIR}" lxc info c2 --project replicator-project || false
+  ! LXD_DIR="${LXD_TWO_DIR}" lxc config device get c1 shareddisk source --project replicator-project || false
+  bulk_op="$(LXD_DIR="${LXD_ONE_DIR}" lxc query --request GET '/1.0/operations?project=replicator-project&recursion=2' \
+    | jq --exit-status '[.. | objects | select(.description == "Running replicator")] | max_by(.created_at)')"
+  jq --exit-status '
+    [.children[] | select(.description == "Replicating instance")]
+    | length == 2 and all(.status == "Failure" and (.err | test("is missing on the target")))
+  ' <<< "${bulk_op}"
+
+  sub_test "Shared volume is not replicated and must exist on the standby beforehand"
+
+  LXD_DIR="${LXD_TWO_DIR}" lxc storage volume create "${vol_pool}" shared-vol --project replicator-project
+
+  LXD_DIR="${LXD_ONE_DIR}" lxc replicator run my-replicator --project replicator-project
+
+  # Both instances replicate against the pre-created shared volume, which the run leaves alone:
+  # the all-exclusive snapshot skips it on the leader and the standby copy stays as created.
+  LXD_DIR="${LXD_TWO_DIR}" lxc list --project replicator-project --format csv --columns ns | grep -xF 'c2,STOPPED'
+  LXD_DIR="${LXD_TWO_DIR}" lxc query "/1.0/storage-pools/${vol_pool}/volumes/custom/shared-vol?project=replicator-project" \
+    | jq --exit-status '.used_by | length == 2'
+  LXD_DIR="${LXD_ONE_DIR}" lxc query "/1.0/storage-pools/${vol_pool}/volumes/custom/shared-vol/snapshots?project=replicator-project" \
+    | jq --exit-status 'length == 0'
+
+  # The info listing covers what replication carries, so the shared volume is left out of it.
+  replicator_info="$(LXD_DIR="${LXD_ONE_DIR}" lxc replicator info my-replicator --project replicator-project)"
+  grep -F 'excl-vol' <<< "${replicator_info}"
+  ! grep -F 'shared-vol' <<< "${replicator_info}" || false
+
+  sub_test "Migration request rejects an unknown disk volumes mode"
+
+  local query_err
+  query_err="$(! CLIENT_DEBUG="" SHELL_TRACING="" LXD_DIR="${LXD_ONE_DIR}" lxc query --request POST --data '{"migration": true, "disk_volumes_mode": "bogus"}' "/1.0/instances/c1?project=replicator-project" 2>&1 || echo fail)"
+  grep -F 'Invalid disk volumes mode "bogus"' <<< "${query_err}"
+
+  # Cleanup
+  LXD_DIR="${LXD_ONE_DIR}" lxc delete c1 c2 --force --project replicator-project
+  LXD_DIR="${LXD_TWO_DIR}" lxc delete c1 c2 --project replicator-project
+  LXD_DIR="${LXD_ONE_DIR}" lxc storage volume delete "${vol_pool}" excl-vol --project replicator-project
+  LXD_DIR="${LXD_ONE_DIR}" lxc storage volume delete "${vol_pool}" shared-vol --project replicator-project
+  LXD_DIR="${LXD_TWO_DIR}" lxc storage volume delete "${vol_pool}" excl-vol --project replicator-project
+  LXD_DIR="${LXD_TWO_DIR}" lxc storage volume delete "${vol_pool}" shared-vol --project replicator-project
+}
+
+_clustering_replicator_volume_restore() {
+  sub_test "Initial replication: replicate an instance with an exclusive volume to LXD_TWO"
+
+  LXD_DIR="${LXD_ONE_DIR}" ensure_import_testimage replicator-project
+  LXD_DIR="${LXD_ONE_DIR}" lxc launch testimage c1 --project replicator-project -d "${SMALL_ROOT_DISK}"
+  LXD_DIR="${LXD_ONE_DIR}" lxc storage volume create "${vol_pool}" replicated-vol --project replicator-project
+  LXD_DIR="${LXD_ONE_DIR}" lxc config device add c1 datadisk disk pool="${vol_pool}" source=replicated-vol path=/mnt --project replicator-project
+
+  LXD_DIR="${LXD_ONE_DIR}" lxc exec c1 --project replicator-project -- sh -c 'echo before > /mnt/marker'
+  LXD_DIR="${LXD_ONE_DIR}" lxc replicator run my-replicator --project replicator-project
+
+  # Both the instance and the volume must be on LXD_TWO.
+  LXD_DIR="${LXD_TWO_DIR}" lxc list --project replicator-project --format csv --columns ns | grep -xF 'c1,STOPPED'
+  LXD_DIR="${LXD_TWO_DIR}" lxc query "/1.0/storage-pools/${vol_pool}/volumes/custom/replicated-vol?project=replicator-project" \
+    | jq --exit-status '.name == "replicated-vol"'
+
+  sub_test "Disaster: kill LXD_ONE and promote LXD_TWO to leader"
+
+  kill_go_proc "$(< "${LXD_ONE_DIR}/lxd.pid")"
+
+  # Wait for LXD_TWO to observe LXD_ONE as unreachable before promoting.
+  local i link_info
+  for i in $(seq 30); do
+    if link_info="$(LXD_DIR="${LXD_TWO_DIR}" lxc cluster link info lxd_one)" && grep -qF 'UNREACHABLE' <<< "${link_info}"; then
+      break
+    fi
+
+    sleep 1
+  done
+
+  grep -F 'UNREACHABLE' <<< "${link_info}"
+
+  LXD_DIR="${LXD_TWO_DIR}" lxc project promote-replica replicator-project --force
+
+  # The promoted copy can run, so the data that arrived with the volume is checked from inside the
+  # instance, and the marker is changed so the restore has data of its own to bring back.
+  LXD_DIR="${LXD_TWO_DIR}" lxc start c1 --project replicator-project
+  [ "$(LXD_DIR="${LXD_TWO_DIR}" lxc exec c1 --project replicator-project -- cat /mnt/marker)" = "before" ]
+  LXD_DIR="${LXD_TWO_DIR}" lxc exec c1 --project replicator-project -- sh -c 'echo after-failover > /mnt/marker'
+  LXD_DIR="${LXD_TWO_DIR}" lxc stop c1 --force --project replicator-project
+
+  # Snapshot the volume on the new leader so the restore has something to bring back.
+  LXD_DIR="${LXD_TWO_DIR}" lxc storage volume snapshot "${vol_pool}" replicated-vol --project replicator-project
+
+  sub_test "Recovery: LXD_ONE comes back online as standby and restores the instance with its volume from LXD_TWO"
+
+  local cluster_state
+  respawn_lxd "${LXD_ONE_DIR}" true
+
+  # Wait for the local one-member cluster to settle after restart.
+  for i in $(seq 30); do
+    if cluster_state="$(LXD_DIR="${LXD_ONE_DIR}" lxc cluster list)" && grep -qwF "node1" <<< "${cluster_state}"; then
+      break
+    fi
+
+    sleep 1
+  done
+
+  grep -wF "node1" <<< "${cluster_state}"
+
+  # Wait for the cluster link to LXD_TWO to become active again.
+  for i in $(seq 30); do
+    if link_info="$(LXD_DIR="${LXD_ONE_DIR}" lxc cluster link info lxd_two)" && grep -qF 'ACTIVE' <<< "${link_info}"; then
+      break
+    fi
+
+    sleep 1
+  done
+
+  grep -F 'ACTIVE' <<< "${link_info}"
+
+  LXD_DIR="${LXD_ONE_DIR}" lxc project demote-replica replicator-project --force
+  LXD_DIR="${LXD_ONE_DIR}" lxc stop c1 --force --project replicator-project
+  LXD_DIR="${LXD_ONE_DIR}" lxc replicator run my-replicator --restore --project replicator-project
+
+  # The volume comes back inside the instance refresh and carries the snapshot taken on LXD_TWO
+  # after the failover, on top of the one from the initial replication.
+  LXD_DIR="${LXD_ONE_DIR}" lxc query "/1.0/storage-pools/${vol_pool}/volumes/custom/replicated-vol/snapshots?project=replicator-project" \
+    | jq --exit-status 'length == 2'
+  LXD_DIR="${LXD_ONE_DIR}" lxc storage volume export "${vol_pool}" replicated-vol "${TEST_DIR}/replicated-vol.tar.gz" --project replicator-project
+  [ "$(tar -xOf "${TEST_DIR}/replicated-vol.tar.gz" backup/volume/marker)" = "after-failover" ]
+  rm -f "${TEST_DIR}/replicated-vol.tar.gz"
+
+  # The restore run produced one instance child (c1) and the finalize child, all successful.
+  local bulk_op
+  bulk_op="$(LXD_DIR="${LXD_ONE_DIR}" lxc query --request GET '/1.0/operations?project=replicator-project&recursion=2' \
+    | jq --exit-status '[.. | objects | select(.description == "Running replicator")] | max_by(.created_at)')"
+  jq --exit-status '
+    .status == "Success"
+    and .child_count == 2
+    and ([.children[] | select(.description == "Restoring replicated instance")] | length) == 1
+    and (all(.children[]; .status == "Success"))
+  ' <<< "${bulk_op}"
+
+  # Cleanup
+  LXD_DIR="${LXD_ONE_DIR}" lxc delete c1 --force --project replicator-project
+  LXD_DIR="${LXD_TWO_DIR}" lxc delete c1 --project replicator-project
+  LXD_DIR="${LXD_ONE_DIR}" lxc storage volume delete "${vol_pool}" replicated-vol --project replicator-project
+  LXD_DIR="${LXD_TWO_DIR}" lxc storage volume delete "${vol_pool}" replicated-vol --project replicator-project
 }
