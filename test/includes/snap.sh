@@ -13,7 +13,7 @@ download_snap() {
         cd "${dir}"
         # Delete any revs older than 1 day
         find . -type f -mtime +1 \( -name "${name}_*.snap" -o -name "${name}_*.assert" \) -delete
-        exec snap download "${name}" --channel="${channel}" --cohort="+"
+        exec timeout 20m snap download "${name}" --channel="${channel}" --cohort="+"
     )
 }
 
@@ -84,6 +84,7 @@ install_snap() {
 
             if [ "${recursive_call}" = "false" ]; then
               echo "Opportunistically downloading ${name} before installation"
+              # shellcheck disable=SC2310 # Function intentionally used in a condition to branch on the result.
               if download_snap "${name}" "${channel}"; then
                   install_snap "${name}" "${channel}"
                   return

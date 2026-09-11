@@ -242,7 +242,7 @@ func projectUsedByMap(ctx context.Context, tx *sql.Tx, projectName string) (map[
 		entity.TypeReplicator,
 	}
 
-	entityURLs, err := dbCluster.GetEntityURLs(ctx, tx, projectName, reportedEntityTypes...)
+	entityURLs, err := dbCluster.GetEntityURLsByProjectAndType(ctx, tx, projectName, reportedEntityTypes...)
 	if err != nil {
 		return nil, fmt.Errorf("Failed getting project used-by URLs: %w", err)
 	}
@@ -805,7 +805,7 @@ func projectChange(ctx context.Context, s *state.State, project *api.Project, re
 	}
 
 	// Ensure that projects with external images storage have their own images enabled. Otherwise flipping
-	// the feature would require to tranfer the images to the default project storage.
+	// the feature would require to transfer the images to the default project storage.
 	if s.LocalConfig.StorageImagesVolume(project.Name) != "" && shared.IsFalseOrEmpty(req.Config["features.images"]) {
 		return response.BadRequest(fmt.Errorf("Project feature %q cannot be disabled on projects with storage.project.%s.images_volume configured", "features.images", project.Name))
 	}
@@ -825,7 +825,7 @@ func projectChange(ctx context.Context, s *state.State, project *api.Project, re
 
 		err = dbCluster.UpdateProject(ctx, tx.Tx(), project.Name, req)
 		if err != nil {
-			return fmt.Errorf("Persist profile changes: %w", err)
+			return fmt.Errorf("Persist project changes: %w", err)
 		}
 
 		if slices.Contains(configChanged, "features.profiles") {
@@ -1043,7 +1043,7 @@ func projectPost(d *Daemon, r *http.Request) response.Response {
 	args := operations.OperationArgs{
 		EntityURL: originalEntityURL,
 		Type:      operationtype.ProjectRename,
-		Class:     operations.OperationClassTask,
+		Class:     operationtype.OperationClassTask,
 		RunHook:   run,
 		Metadata: map[string]any{
 			api.MetadataOriginalEntityURL: originalEntityURL.String(),
@@ -1056,7 +1056,7 @@ func projectPost(d *Daemon, r *http.Request) response.Response {
 		return response.InternalError(err)
 	}
 
-	return operations.OperationResponse(op)
+	return response.OperationResponse(op)
 }
 
 func projectNodeConfigDelete(ctx context.Context, d *Daemon, s *state.State, name string) error {
@@ -1245,7 +1245,7 @@ func projectDelete(d *Daemon, r *http.Request) response.Response {
 
 		op, err := operations.ScheduleUserOperationFromRequest(s, r, operations.OperationArgs{
 			Type:      operationtype.ProjectDelete,
-			Class:     operations.OperationClassTask,
+			Class:     operationtype.OperationClassTask,
 			EntityURL: entity.ProjectURL(name),
 			RunHook:   run,
 		})
@@ -1253,7 +1253,7 @@ func projectDelete(d *Daemon, r *http.Request) response.Response {
 			return response.SmartError(err)
 		}
 
-		return operations.OperationResponse(op)
+		return response.OperationResponse(op)
 	}
 
 	var cachedImages []dbCluster.Image
@@ -1399,7 +1399,7 @@ func projectDelete(d *Daemon, r *http.Request) response.Response {
 
 	op, err := operations.ScheduleUserOperationFromRequest(s, r, operations.OperationArgs{
 		Type:      operationtype.ProjectDelete,
-		Class:     operations.OperationClassTask,
+		Class:     operationtype.OperationClassTask,
 		EntityURL: entity.ProjectURL(project.Name),
 		RunHook:   run,
 	})
@@ -1407,7 +1407,7 @@ func projectDelete(d *Daemon, r *http.Request) response.Response {
 		return response.SmartError(err)
 	}
 
-	return operations.OperationResponse(op)
+	return response.OperationResponse(op)
 }
 
 // swagger:operation GET /1.0/projects/{name}/state projects project_state_get
@@ -1540,7 +1540,7 @@ func projectStatePut(d *Daemon, r *http.Request) response.Response {
 
 	op, err := operations.ScheduleUserOperationFromRequest(s, r, operations.OperationArgs{
 		Type:      operationtype.ProjectReplicaModeUpdate,
-		Class:     operations.OperationClassTask,
+		Class:     operationtype.OperationClassTask,
 		EntityURL: entity.ProjectURL(name),
 		RunHook:   run,
 	})
@@ -1548,7 +1548,7 @@ func projectStatePut(d *Daemon, r *http.Request) response.Response {
 		return response.SmartError(err)
 	}
 
-	return operations.OperationResponse(op)
+	return response.OperationResponse(op)
 }
 
 // validateProjectPromote validates that a project is ready to be promoted to leader mode.
@@ -1837,7 +1837,7 @@ func projectValidateConfig(ctx context.Context, s *state.State, config map[strin
 		//  shortdesc: Whether to use a separate set of storage buckets for the project
 		"features.storage.buckets": validate.Optional(validate.IsBool),
 		// lxdmeta:generate(entities=project; group=features; key=features.networks)
-		//
+		// This feature requires `features.profiles` to be enabled.
 		// ---
 		//  type: bool
 		//  defaultdesc: `false`
@@ -2013,7 +2013,7 @@ func projectValidateConfig(ctx context.Context, s *state.State, config map[strin
 		// lxdmeta:generate(entities=project; group=restricted; key=restricted.containers.privilege)
 		// Possible values are `unprivileged`, `isolated`, and `allow`.
 		//
-		// - When set to `unpriviliged`, this option prevents setting {config:option}`instance-security:security.privileged` to `true`.
+		// - When set to `unprivileged`, this option prevents setting {config:option}`instance-security:security.privileged` to `true`.
 		// - When set to `isolated`, this option prevents setting {config:option}`instance-security:security.privileged` to `true` and forces using a unique idmap per container using {config:option}`instance-security:security.idmap.isolated` set to `true`.
 		// - When set to `allow`, there is no restriction.
 		// ---
@@ -2185,19 +2185,8 @@ func projectValidateConfig(ctx context.Context, s *state.State, config map[strin
 		//  type: string
 		//  shortdesc: Cluster link allowed to replicate to this standby project.
 		"replica.cluster": validate.Optional(func(value string) error {
-			err := s.DB.Cluster.Transaction(ctx, func(dbCtx context.Context, tx *db.ClusterTx) error {
-				_, err := dbCluster.GetClusterLink(dbCtx, tx.Tx(), value)
-				if err != nil {
-					return api.StatusErrorf(http.StatusNotFound, "Cluster link %q not found", value)
-				}
-
-				return nil
-			})
-			if err != nil {
-				return err
-			}
-
-			return s.Authorizer.CheckPermission(ctx, entity.ClusterLinkURL(value), auth.EntitlementCanView)
+			// Rejected here rather than during promotion or demotion.
+			return validateReplicationClusterLink(ctx, s, value)
 		}),
 	}
 
@@ -2290,6 +2279,12 @@ func projectValidateConfig(ctx context.Context, s *state.State, config map[strin
 		if err != nil {
 			return fmt.Errorf("Invalid project configuration key %q value: %w", k, err)
 		}
+	}
+
+	// Ensure that projects with their own networks also have their own profiles. Otherwise the profiles of the
+	// default project could reference networks that do not exist in this project.
+	if shared.IsTrue(config["features.networks"]) && shared.IsFalseOrEmpty(config["features.profiles"]) {
+		return errors.New("Projects without their own profiles cannot have their own networks")
 	}
 
 	// Ensure that restricted projects have their own profiles. Otherwise restrictions in this project could

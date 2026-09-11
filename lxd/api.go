@@ -3,6 +3,7 @@ package main
 import (
 	"net/http"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -14,6 +15,7 @@ import (
 	"github.com/canonical/lxd/lxd/metrics"
 	"github.com/canonical/lxd/lxd/request"
 	"github.com/canonical/lxd/lxd/response"
+	"github.com/canonical/lxd/lxd/util"
 	"github.com/canonical/lxd/shared/api"
 	"github.com/canonical/lxd/shared/entity"
 	"github.com/canonical/lxd/shared/logger"
@@ -31,6 +33,14 @@ func restServer(d *Daemon) *http.Server {
 		// Every 1.0 endpoint should have a type for the API metrics.
 		if !slices.Contains(entity.APIMetricsEntityTypes(), c.MetricsType) {
 			panic(`Endpoint "/1.0/` + c.Path + `" has invalid MetricsType: ` + string(c.MetricsType))
+		}
+
+		// Every endpoint action should have a valid all-projects mode.
+		// The default value is allProjectsModeNotSupported.
+		for _, e := range []APIEndpointAction{c.Get, c.Head, c.Put, c.Patch, c.Delete, c.Post} {
+			if !slices.Contains([]allProjectsMode{allProjectsModeAllowAll, allProjectsModeDisallowRestrictedTLSClients, allProjectsModeNotSupported}, e.AllProjectsMode) {
+				panic(`Endpoint "/1.0/` + c.Path + `" has invalid all-projects mode: ` + strconv.Itoa(int(e.AllProjectsMode)))
+			}
 		}
 
 		d.createCmd(mux, "1.0", c)
@@ -60,7 +70,7 @@ func restServer(d *Daemon) *http.Server {
 		Handler:           &lxdHTTPServer{r: mux, d: d},
 		ConnContext:       request.SaveConnectionInContext,
 		IdleTimeout:       30 * time.Second,
-		ReadHeaderTimeout: 3 * time.Second,
+		ReadHeaderTimeout: util.HTTPServerReadTimeout,
 	}
 }
 
@@ -98,8 +108,8 @@ func metricsServer(d *Daemon) *http.Server {
 	return &http.Server{
 		Handler:           &lxdHTTPServer{r: mux, d: d},
 		IdleTimeout:       30 * time.Second,
-		ReadHeaderTimeout: 3 * time.Second,
-		ReadTimeout:       3 * time.Second,
+		ReadHeaderTimeout: util.HTTPServerReadTimeout,
+		ReadTimeout:       util.HTTPServerReadTimeout,
 		WriteTimeout:      30 * time.Second,
 	}
 }

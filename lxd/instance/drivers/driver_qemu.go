@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"maps"
 	"net"
 	"net/http"
 	"net/url"
@@ -362,7 +363,10 @@ func (d *qemu) getAgentClient() (*http.Client, error) {
 	}
 
 	// The connection uses mutual authentication, so use the LXD server's key & cert for client.
-	agentCert, _, clientCert, clientKey, err := d.generateAgentCert()
+	// Read the certificates rather than generating them: the instance is already
+	// running, so they exist, and generating here would write into a possibly
+	// unmounted instance directory (see readAgentCert).
+	agentCert, clientCert, clientKey, err := d.readAgentCert()
 	if err != nil {
 		return nil, err
 	}
@@ -490,7 +494,50 @@ func (d *qemu) unmount() error {
 	return nil
 }
 
+// readAgentCert reads the instance's existing agent certificates, without ever
+// creating them.
+//
+// It is meant for callers that run while the instance is already up, where the
+// certificates are expected to have been created at startup. Those callers must
+// not fall back to generating a fresh set.
+//
+// These live on the instance's config volume, which for a running instance is of
+// course mounted -- but not necessarily in the mount namespace of the daemon
+// asking. After a snap refresh the daemon restarts into a new namespace, where
+// the config volume is not mounted until RegisterDevices re-establishes it, and
+// getAgentClient is driven by QMP events that can fire before that happens.
+// Generating then writes a stray set into the *underlying* instance directory and
+// breaks the agent connection, which still trusts the original certificates. The
+// stray files get shadowed once the config volume is mounted over them, and
+// resurface at deletion time as "Failed removing ... directory not empty".
+func (d *qemu) readAgentCert() (agentCert string, clientCert string, clientKey string, err error) {
+	instancePath := d.Path()
+
+	for _, f := range []struct {
+		out  *string
+		name string
+	}{
+		{&agentCert, "agent.crt"},
+		{&clientCert, "agent-client.crt"},
+		{&clientKey, "agent-client.key"},
+	} {
+		contents, err := os.ReadFile(filepath.Join(instancePath, f.name))
+		if err != nil {
+			return "", "", "", fmt.Errorf("Failed reading agent TLS material %q (the instance's config volume may not be mounted in this mount namespace): %w", f.name, err)
+		}
+
+		*f.out = string(contents)
+	}
+
+	return agentCert, clientCert, clientKey, nil
+}
+
 // generateAgentCert creates the necessary server key and certificate if needed.
+//
+// This writes into the instance's directory, so it must only be called on paths
+// where the instance's volume is known to be mounted (e.g. instance startup).
+// Callers that merely need to read the certificates of a running instance must
+// use readAgentCert instead.
 func (d *qemu) generateAgentCert() (agentCert string, agentKey string, clientCert string, clientKey string, err error) {
 	instancePath := d.Path()
 	agentCertFile := filepath.Join(instancePath, "agent.crt")
@@ -510,8 +557,9 @@ func (d *qemu) generateAgentCert() (agentCert string, agentKey string, clientCer
 		return "", "", "", "", err
 	}
 
-	// Read all the files
-	agentCertBytes, err := os.ReadFile(agentCertFile)
+	// Read back what was just created. Everything but the server key is shared
+	// with the read-only path.
+	agentCert, clientCert, clientKey, err = d.readAgentCert()
 	if err != nil {
 		return "", "", "", "", err
 	}
@@ -521,17 +569,7 @@ func (d *qemu) generateAgentCert() (agentCert string, agentKey string, clientCer
 		return "", "", "", "", err
 	}
 
-	clientCertBytes, err := os.ReadFile(clientCertFile)
-	if err != nil {
-		return "", "", "", "", err
-	}
-
-	clientKeyBytes, err := os.ReadFile(clientKeyFile)
-	if err != nil {
-		return "", "", "", "", err
-	}
-
-	return string(agentCertBytes), string(agentKeyBytes), string(clientCertBytes), string(clientKeyBytes), nil
+	return agentCert, string(agentKeyBytes), clientCert, clientKey, nil
 }
 
 // Freeze freezes the instance.
@@ -559,6 +597,15 @@ func (d *qemu) configDriveMountPath() string {
 
 // configDriveMountPathClear attempts to unmount the config drive bind mount and remove the directory.
 func (d *qemu) configDriveMountPathClear() error {
+	// Unmount the nested lxd-agent bind mount first, otherwise the parent mount is busy.
+	agentMntPath := filepath.Join(d.configDriveMountPath(), "lxd-agent")
+	if filesystem.IsMountPoint(agentMntPath) {
+		err := storageDrivers.TryUnmount(agentMntPath, unix.MNT_DETACH)
+		if err != nil {
+			return fmt.Errorf("Failed unmounting lxd-agent bind mount %q: %w", agentMntPath, err)
+		}
+	}
+
 	return device.DiskMountClear(d.configDriveMountPath())
 }
 
@@ -1242,8 +1289,17 @@ func (d *qemu) start(ctx context.Context, stateful bool, op *operationlock.Insta
 		volatileSet["volatile.uuid.generation"] = vmGenUUID
 	}
 
+	// Resolve the host lxd-agent once so the config drive placeholder and the bind mount
+	// below agree on the same binary. Empty if the agent is not installed.
+	lxdAgentSrcPath, err := d.lxdAgentSourcePath()
+	if err != nil {
+		err = fmt.Errorf("Failed resolving lxd-agent path: %w", err)
+		op.Done(err)
+		return err
+	}
+
 	// Generate the config drive.
-	err = d.generateConfigShare()
+	err = d.generateConfigShare(lxdAgentSrcPath)
 	if err != nil {
 		op.Done(err)
 		return err
@@ -1271,7 +1327,13 @@ func (d *qemu) start(ctx context.Context, stateful bool, op *operationlock.Insta
 	// Copy EDK2 settings firmware to nvram file if needed.
 	// This firmware file can be modified by the VM so it must be copied from the defaults.
 	if supportsUEFI {
-		// ovmfNeedsUpdate checks if nvram file needs to be regenerated using new template.
+		// ovmfNeedsUpdate checks if the NVRAM file must be regenerated from the
+		// firmware template. This action is destructive in the sense that the
+		// NVRAM state is lost which is not ideal but also not terrible as it is
+		// rarely used (only for custom SB keys, boot order tweaks, etc). This
+		// covers cases where the existing NVRAM content is genuinely
+		// incompatible with the current firmware. The OVMF 4MB -> _4M rename
+		// (content-compatible) is handled separately below.
 		ovmfNeedsUpdate := func(nvramTarget string) bool {
 			if !shared.InSnap() {
 				return false
@@ -1285,8 +1347,10 @@ func (d *qemu) start(ctx context.Context, stateful bool, op *operationlock.Insta
 				return true
 			} else if strings.Contains(nvramTarget, "OVMF") {
 				// The 2MB firmware was deprecated in the LXD snap.
-				// Detect this by the absence of "4MB" in the nvram file target.
-				if !strings.Contains(nvramTarget, "4MB") {
+				// Detect this by the absence of both "4MB" and "_4M" in the nvram file target.
+				// Note: "_4M" must also be accepted as valid to handle VMs that were already
+				// migrated to the new naming convention (e.g. by an updated snap).
+				if !strings.Contains(nvramTarget, "4MB") && !strings.Contains(nvramTarget, "_4M") {
 					return true
 				}
 
@@ -1316,6 +1380,18 @@ func (d *qemu) start(ctx context.Context, stateful bool, op *operationlock.Insta
 		// Decide if nvram file needs to be setup/refreshed.
 		if nvramMissing || shared.IsTrue(d.localConfig["volatile.apply_nvram"]) || ovmfNeedsUpdate(nvramTarget) {
 			err = d.setupNvram()
+			if err != nil {
+				op.Done(err)
+				return err
+			}
+		} else if !nvramMissing {
+			// When the firmware filename convention changed but the content is
+			// identical (e.g. OVMF 4MB -> _4M on x86_64, or OVMF-named arm64 ->
+			// AAVMF), rename the existing file to preserve boot order, custom
+			// Secure Boot keys, and other NVRAM state. renameNvram only proceeds
+			// when the preferred firmware actually exists in the snap, making it
+			// safe to deploy this LXD change before the snap is updated.
+			_, err = d.renameNvram(nvramTarget)
 			if err != nil {
 				op.Done(err)
 				return err
@@ -1441,11 +1517,24 @@ func (d *qemu) start(ctx context.Context, stateful bool, op *operationlock.Insta
 		return err
 	}
 
+	// Bind-mount the host lxd-agent over the placeholder so its bytes come from the host,
+	// not the quota'd config volume (see generateConfigShare). This intentionally pins the
+	// running daemon's agent revision for the VM's lifetime, as the daemon does for itself.
+	if lxdAgentSrcPath != "" {
+		agentDstPath := filepath.Join(configMntPath, "lxd-agent")
+		err = device.DiskMount(lxdAgentSrcPath, agentDstPath, false, "", []string{"ro"}, "none")
+		if err != nil {
+			err = fmt.Errorf("Failed mounting lxd-agent into config drive: %w", err)
+			op.Done(err)
+			return err
+		}
+	}
+
 	// Setup virtiofsd for the config drive mount path.
 	// This is used by the lxd-agent in preference to 9p (due to its improved performance) and in scenarios
 	// where 9p isn't available in the VM guest OS.
 	configSockPath, configPIDPath := d.configVirtiofsdPaths()
-	revertFunc, unixListener, err := device.DiskVMVirtiofsdStart(d, configSockPath, configPIDPath, "", configMntPath, nil, 0)
+	revertFunc, err := device.DiskVMVirtiofsdStart(d, configSockPath, configPIDPath, "", configMntPath, nil, 0)
 	if err != nil {
 		var errUnsupported device.UnsupportedError
 		if !errors.As(err, &errUnsupported) {
@@ -1469,9 +1558,6 @@ func (d *qemu) start(ctx context.Context, stateful bool, op *operationlock.Insta
 		}
 	} else {
 		revert.Add(revertFunc)
-
-		// Request the unix listener is closed after QEMU has connected on startup.
-		defer func() { _ = unixListener.Close() }()
 	}
 
 	// Get qemu configuration and check qemu is installed.
@@ -1508,10 +1594,11 @@ func (d *qemu) start(ctx context.Context, stateful bool, op *operationlock.Insta
 	cpuExtensions := []string{}
 
 	if d.architecture == osarch.ARCH_64BIT_INTEL_X86 {
-		// If using Linux 5.10 or later, use HyperV optimizations.
+		// If using Linux 5.10 or later, use HyperV optimizations when not using migration.stateful or BIOS mode.
+		// Hyper-V extensions can cause problems with live migration and Windows booting in BIOS mode.
 		minVer, _ := version.NewDottedVersion("5.10.0")
-		if d.state.OS.KernelVersion.Compare(minVer) >= 0 && shared.IsFalseOrEmpty(d.expandedConfig["migration.stateful"]) {
-			// x86_64 can use hv_time to improve Windows guest performance.
+		if d.state.OS.KernelVersion.Compare(minVer) >= 0 && shared.IsFalseOrEmpty(d.expandedConfig["migration.stateful"]) && d.effectiveBootMode() != instancetype.BootModeBIOS {
+			// x86_64 with UEFI can use hv_time (bundled in hv_passthrough) to improve Windows guest performance.
 			cpuExtensions = append(cpuExtensions, "hv_passthrough")
 		}
 
@@ -2053,6 +2140,94 @@ func (d *qemu) effectiveBootMode() string {
 	}
 
 	return bootMode
+}
+
+// renameNvram renames the existing NVRAM vars file when the firmware filename has
+// changed but the content remains compatible, preserving any existing boot settings
+// such as boot order or custom Secure Boot keys. This covers:
+//   - OVMF 4MB -> _4M rename on x86_64 (identical binary content)
+//   - OVMF-named arm64 EDK2 -> AAVMF rename (both are AArch64 EDK2 builds)
+//
+// Returns true if the rename was performed successfully.
+func (d *qemu) renameNvram(nvramTarget string) (bool, error) {
+	if !shared.InSnap() {
+		return false, nil
+	}
+
+	// Only applicable to OVMF 4MB variants: the 4MB size is the content-compatible
+	// baseline used across all renames handled here (x86_64 _4M and arm64 AAVMF).
+	nvramBasename := filepath.Base(nvramTarget)
+	if !strings.Contains(nvramBasename, "OVMF") || !strings.Contains(nvramBasename, "4MB") {
+		return false, nil
+	}
+
+	// Determine the expected firmware for this VM's boot mode.
+	var firmwares []edk2.FirmwarePair
+	switch d.effectiveBootMode() {
+	case instancetype.BootModeUEFISecureBoot:
+		firmwares = edk2.GetArchitectureFirmwarePairsForUsage(d.architecture, edk2.SECUREBOOT)
+	default:
+		firmwares = edk2.GetArchitectureFirmwarePairsForUsage(d.architecture, edk2.GENERIC)
+	}
+
+	if len(firmwares) == 0 {
+		return false, nil
+	}
+
+	// The preferred (first available) firmware determines the new vars filename.
+	newVarsName := filepath.Base(firmwares[0].Vars)
+
+	// Nothing to rename if the preferred firmware already matches the current one.
+	if newVarsName == nvramBasename {
+		return false, nil
+	}
+
+	newVarsPath := filepath.Join(d.Path(), newVarsName)
+
+	// If the destination already exists the file was previously migrated (e.g. by an earlier
+	// LXD start that failed mid-way). Skip the rename to avoid overwriting current NVRAM state.
+	_, err := os.Stat(newVarsPath)
+	if err == nil {
+		d.logger.Info("Skipping NVRAM vars file rename, destination already exists", logger.Ctx{"source": nvramBasename, "destination": newVarsName})
+		return false, nil
+	}
+
+	if !os.IsNotExist(err) {
+		return false, fmt.Errorf("Failed checking existing NVRAM vars file %q: %w", newVarsPath, err)
+	}
+
+	// Rename the vars file and update the symlink atomically so that a failure mid-way
+	// does not leave the instance in an unbootable state.
+	rev := revert.New()
+	defer rev.Fail()
+
+	err = os.Rename(nvramTarget, newVarsPath)
+	if err != nil {
+		return false, fmt.Errorf("Failed renaming NVRAM vars file %q to %q: %w", nvramTarget, newVarsPath, err)
+	}
+
+	rev.Add(func() { _ = os.Rename(newVarsPath, nvramTarget) })
+
+	// Update the symlink via a temporary name so the replacement is atomic.
+	nvramPath := d.nvramPath()
+	tmpNvramPath := nvramPath + ".tmp"
+	_ = os.Remove(tmpNvramPath)
+
+	err = os.Symlink(newVarsName, tmpNvramPath)
+	if err != nil {
+		return false, fmt.Errorf("Failed creating temporary NVRAM symlink to %q: %w", newVarsName, err)
+	}
+
+	err = os.Rename(tmpNvramPath, nvramPath)
+	if err != nil {
+		_ = os.Remove(tmpNvramPath)
+		return false, fmt.Errorf("Failed updating NVRAM symlink to %q: %w", newVarsName, err)
+	}
+
+	rev.Success()
+
+	d.logger.Info("Renamed NVRAM vars file", logger.Ctx{"old": nvramBasename, "new": newVarsName})
+	return true, nil
 }
 
 func (d *qemu) setupNvram() error {
@@ -2965,11 +3140,22 @@ func (d *qemu) spiceCmdlineConfig() string {
 	return "unix=on,disable-ticketing=on,addr=" + d.spicePath()
 }
 
+// lxdAgentSourcePath returns the resolved path to the host lxd-agent binary, or an empty
+// string if it is not installed (the VM then starts without an up-to-date agent).
+func (d *qemu) lxdAgentSourcePath() (string, error) {
+	srcPath, err := exec.LookPath("lxd-agent")
+	if err != nil {
+		return "", nil
+	}
+
+	return filepath.EvalSymlinks(srcPath)
+}
+
 // generateConfigShare generates the config share directory that will be exported to the VM via
 // a 9P share. Due to the unknown size of templates inside the images this directory is created
 // inside the VM's config volume so that it can be restricted by quota.
 // Requires the instance be mounted before calling this function.
-func (d *qemu) generateConfigShare() error {
+func (d *qemu) generateConfigShare(lxdAgentSrcPath string) error {
 	configDrivePath := filepath.Join(d.Path(), "config")
 
 	// Create config drive dir if doesn't exist, if it does exist, leave it around so we don't regenerate all
@@ -2979,61 +3165,20 @@ func (d *qemu) generateConfigShare() error {
 		return err
 	}
 
-	// Add the VM agent.
-	lxdAgentSrcPath, err := exec.LookPath("lxd-agent")
-	if err != nil {
-		d.logger.Warn("lxd-agent not found, skipping its inclusion in the VM config drive", logger.Ctx{"err": err})
+	// Keep only a placeholder here; the real binary is bind-mounted over it in start() so it
+	// never occupies the quota'd config volume. Only touch it when a host agent exists to mount
+	// later, else leave any existing binary in place.
+	if lxdAgentSrcPath == "" {
+		d.logger.Warn("lxd-agent not found, skipping its inclusion in the VM config drive")
 	} else {
-		// Install agent into config drive dir if found.
-		lxdAgentSrcPath, err = filepath.EvalSymlinks(lxdAgentSrcPath)
-		if err != nil {
-			return err
-		}
-
-		lxdAgentSrcInfo, err := os.Stat(lxdAgentSrcPath)
-		if err != nil {
-			return fmt.Errorf("Failed getting info for lxd-agent source %q: %w", lxdAgentSrcPath, err)
-		}
-
+		// O_TRUNC reclaims the space used by a full binary copied by an older LXD version.
 		lxdAgentInstallPath := filepath.Join(configDrivePath, "lxd-agent")
-		lxdAgentNeedsInstall := true
-
-		lxdAgentInstallInfo, err := os.Stat(lxdAgentInstallPath)
-		if err == nil {
-			if lxdAgentInstallInfo.ModTime().Equal(lxdAgentSrcInfo.ModTime()) && lxdAgentInstallInfo.Size() == lxdAgentSrcInfo.Size() {
-				lxdAgentNeedsInstall = false
-			}
-		} else if !errors.Is(err, fs.ErrNotExist) {
-			return fmt.Errorf("Failed getting info for existing lxd-agent install %q: %w", lxdAgentInstallPath, err)
+		f, err := os.OpenFile(lxdAgentInstallPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0500)
+		if err != nil {
+			return fmt.Errorf("Failed creating lxd-agent placeholder %q: %w", lxdAgentInstallPath, err)
 		}
 
-		// Only install the lxd-agent into config drive if the existing one is different to the source one.
-		// Otherwise we would end up copying it again and this can cause unnecessary snapshot usage.
-		if lxdAgentNeedsInstall {
-			d.logger.Debug("Installing lxd-agent", logger.Ctx{"srcPath": lxdAgentSrcPath, "installPath": lxdAgentInstallPath})
-			err = shared.FileCopy(lxdAgentSrcPath, lxdAgentInstallPath)
-			if err != nil {
-				return err
-			}
-
-			err = os.Chmod(lxdAgentInstallPath, 0500)
-			if err != nil {
-				return err
-			}
-
-			err = os.Chown(lxdAgentInstallPath, 0, 0)
-			if err != nil {
-				return err
-			}
-
-			// Ensure we copy the source file's timestamps so they can be used for comparison later.
-			err = os.Chtimes(lxdAgentInstallPath, lxdAgentSrcInfo.ModTime(), lxdAgentSrcInfo.ModTime())
-			if err != nil {
-				return fmt.Errorf("Failed setting lxd-agent timestamps: %w", err)
-			}
-		} else {
-			d.logger.Debug("Skipping lxd-agent install as unchanged", logger.Ctx{"srcPath": lxdAgentSrcPath, "installPath": lxdAgentInstallPath})
-		}
+		_ = f.Close()
 	}
 
 	agentCert, agentKey, clientCert, _, err := d.generateAgentCert()
@@ -3068,7 +3213,7 @@ func (d *qemu) generateConfigShare() error {
 # LXD VM, rather than being enabled at boot.
 [Unit]
 Description=LXD - agent
-Documentation=https://documentation.ubuntu.com/lxd/latest/
+Documentation=https://canonical.com/lxd/docs/latest/
 Before=multi-user.target cloud-init-local.service shutdown.target umount.target
 After=local-fs.target systemd-journald.socket
 Conflicts=shutdown.target
@@ -3301,7 +3446,7 @@ echo "To start it now, unmount this filesystem and run: systemctl start lxd-agen
 		// Run any template that needs running.
 		err = d.templateApplyNow(instance.TemplateTrigger(d.localConfig[key]), templateFilesPath)
 		if err != nil {
-			return err
+			return fmt.Errorf("Failed applying template: %w", err)
 		}
 
 		err := d.state.DB.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
@@ -3315,7 +3460,7 @@ echo "To start it now, unmount this filesystem and run: systemctl start lxd-agen
 
 	err = d.templateApplyNow("start", templateFilesPath)
 	if err != nil {
-		return err
+		return fmt.Errorf("Failed applying template: %w", err)
 	}
 
 	// Copy the template metadata itself too.
@@ -3351,13 +3496,27 @@ echo "To start it now, unmount this filesystem and run: systemctl start lxd-agen
 }
 
 func (d *qemu) templateApplyNow(trigger instance.TemplateTrigger, path string) error {
-	// If there's no metadata, just return.
-	metadata, err := ParseImageMetadataFile(filepath.Join(d.Path(), "metadata.yaml"))
+	instanceRoot, err := d.OpenRoot()
 	if err != nil {
+		return err
+	}
+
+	defer func() { _ = instanceRoot.Close() }()
+
+	metadataFile, err := instanceRoot.Open("metadata.yaml")
+	if err != nil {
+		// If there's no metadata, just return.
 		if errors.Is(err, fs.ErrNotExist) {
 			return nil
 		}
 
+		return err
+	}
+
+	defer func() { _ = metadataFile.Close() }()
+
+	metadata, err := ParseImageMetadataFile(metadataFile)
+	if err != nil {
 		return fmt.Errorf("Failed reading metadata: %w", err)
 	}
 
@@ -3389,6 +3548,16 @@ func (d *qemu) templateApplyNow(trigger instance.TemplateTrigger, path string) e
 
 	defer func() { _ = templatesRoot.Close() }()
 
+	// Open the output directory as a confined *os.Root so that a template's
+	// attacker-influenced source name cannot be used to escape the config
+	// drive's files directory when computing the ".out" target path.
+	outputRoot, err := os.OpenRoot(path)
+	if err != nil {
+		return err
+	}
+
+	defer func() { _ = outputRoot.Close() }()
+
 	// Go through the templates.
 	for tplPath, tpl := range metadata.Templates {
 		err = func(tplPath string, tpl *api.ImageMetadataTemplate) error {
@@ -3401,19 +3570,22 @@ func (d *qemu) templateApplyNow(trigger instance.TemplateTrigger, path string) e
 				return nil
 			}
 
-			// Create the file itself.
-			w, err = os.Create(filepath.Join(path, tpl.Template+".out"))
+			// Create the file itself. The confined *os.Root prevents the target
+			// path from escaping the output directory.
+			relPath := filepath.Clean(tpl.Template + ".out")
+
+			w, err = outputRoot.OpenFile(relPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
 			if err != nil {
-				return err
+				return fmt.Errorf("Failed creating template file %q: %w", tpl.Template, err)
 			}
+
+			defer func() { _ = w.Close() }()
 
 			// Fix ownership and mode.
 			err = w.Chmod(0644)
 			if err != nil {
 				return err
 			}
-
-			defer func() { _ = w.Close() }()
 
 			// Read the template.
 			tplString, err := templatesRoot.ReadFile(tpl.Template)
@@ -3552,9 +3724,16 @@ func (d *qemu) generateQemuConfigFile(cpuInfo *cpuTopology, mountInfo *storagePo
 			return "", nil, fmt.Errorf("Cannot locate matching VM firmware: %+v", firmwares)
 		}
 
-		// Use debug version of firmware. (Only works for "preferred" (OVMF 4MB, no CSM) firmware flavor)
-		if shared.IsTrue(d.expandedConfig["boot.debug_edk2"]) && efiCode == firmwares[0].Code {
-			efiCode = filepath.Join(filepath.Dir(efiCode), edk2.OVMFDebugFirmware)
+		// Use debug version of firmware when boot.debug_edk2 is set.
+		// The debug firmware path is derived by inserting ".debug" before the ".fd" extension.
+		// An error is returned if the debug firmware file does not exist.
+		if shared.IsTrue(d.expandedConfig["boot.debug_edk2"]) && strings.HasSuffix(efiCode, ".fd") {
+			debugCode := strings.TrimSuffix(efiCode, ".fd") + ".debug.fd"
+			if !shared.PathExists(debugCode) {
+				return "", nil, fmt.Errorf("Cannot find debug firmware %q", debugCode)
+			}
+
+			efiCode = debugCode
 		}
 
 		driveFirmwareOpts := qemuDriveFirmwareOpts{
@@ -3983,7 +4162,7 @@ func (d *qemu) generateQemuConfigFile(cpuInfo *cpuTopology, mountInfo *storagePo
 // If sb is nil then no config is written.
 func (d *qemu) addCPUMemoryConfig(cfg *[]cfgSection, cpuInfo *cpuTopology) error {
 	cpuOpts := qemuCPUOpts{
-		architecture:        d.architectureName,
+		architecture:        d.architecture,
 		qemuMemObjectFormat: "indexed", // Supported by QEMU 6.0+
 	}
 
@@ -4032,7 +4211,13 @@ func (d *qemu) addCPUMemoryConfig(cfg *[]cfgSection, cpuInfo *cpuTopology) error
 		//nolint:prealloc
 		numaIDs := []uint64{}
 		numaNode := uint64(0)
-		for hostNode, entry := range cpuInfo.nodes {
+
+		// Iterate the host NUMA nodes in a stable order so the generated QEMU
+		// config (node IDs, memory backends and vCPU mappings) stays consistent
+		// across runs. cpuInfo.nodes is a map, whose iteration order is random.
+		sortedHostNodes := slices.Sorted(maps.Keys(cpuInfo.nodes))
+		for _, hostNode := range sortedHostNodes {
+			entry := cpuInfo.nodes[hostNode]
 			hostNodes = append(hostNodes, hostNode)
 
 			numaIDs = append(numaIDs, numaNode)
@@ -4081,7 +4266,12 @@ func (d *qemu) addCPUMemoryConfig(cfg *[]cfgSection, cpuInfo *cpuTopology) error
 
 	// Determine per-node memory limit.
 	memSizeMB := memSizeBytes / 1024 / 1024
-	nodeMemory := int64(memSizeMB / int64(len(hostNodes)))
+	nodeMemory := memSizeMB
+	if d.architecture == osarch.ARCH_64BIT_INTEL_X86 {
+		// On x86_64 the memory is split across one backend per NUMA node.
+		nodeMemory = memSizeMB / int64(len(hostNodes))
+	}
+
 	cpuOpts.memory = nodeMemory
 
 	if cfg != nil {
@@ -4129,7 +4319,7 @@ func (d *qemu) addRootDriveConfig(busAllocate busAllocator, mountInfo *storagePo
 
 			clusterName := config["ceph.cluster_name"]
 			if clusterName == "" {
-				clusterName = storageDrivers.CephDefaultUser
+				clusterName = storageDrivers.CephDefaultCluster
 			}
 
 			rbdImageName, snapName := storageDrivers.CephGetRBDImageName(vol, false)
@@ -6566,13 +6756,37 @@ func (d *qemu) Export(w io.Writer, properties map[string]string, expiration time
 		return nil
 	}
 
-	// Parse the metadata file.
-	fnam := filepath.Join(cDir, "metadata.yaml")
-	existingMetadata, err := ParseImageMetadataFile(fnam)
+	instanceRoot, err := d.OpenRoot()
+	if err != nil {
+		_ = tarWriter.Close()
+		d.logger.Error("Failed exporting instance", ctxMap)
+		return meta, err
+	}
+
+	defer func() { _ = instanceRoot.Close() }()
+
+	metadataFile, err := instanceRoot.Open("metadata.yaml")
 	if err != nil && !errors.Is(err, fs.ErrNotExist) {
 		_ = tarWriter.Close()
 		d.logger.Error("Failed exporting instance", ctxMap)
 		return meta, err
+	}
+
+	var fnam string
+	var existingMetadata *api.ImageMetadata
+
+	if metadataFile != nil {
+		defer func() { _ = metadataFile.Close() }()
+
+		// Parse the metadata file.
+		existingMetadata, err = ParseImageMetadataFile(metadataFile)
+		if err != nil {
+			_ = tarWriter.Close()
+			d.logger.Error("Failed exporting instance", ctxMap)
+			return meta, err
+		}
+
+		fnam = filepath.Join(instanceRoot.Name(), "metadata.yaml")
 	}
 
 	if existingMetadata == nil {
@@ -6641,8 +6855,7 @@ func (d *qemu) Export(w io.Writer, properties map[string]string, expiration time
 			return meta, err
 		}
 
-		tmpOffset := len(filepath.Dir(fnam)) + 1
-		err = tarWriter.WriteFile(fnam[tmpOffset:], fnam, fi, false)
+		err = tarWriter.WriteFile("metadata.yaml", fnam, fi, false)
 		if err != nil {
 			_ = tarWriter.Close()
 			d.logger.Error("Failed exporting instance", ctxMap)
@@ -6688,7 +6901,13 @@ func (d *qemu) Export(w io.Writer, properties map[string]string, expiration time
 		}
 
 		// Include metadata.yaml in the tarball.
-		fi, err := os.Lstat(fnam)
+		var fi fs.FileInfo
+		if properties != nil || !expiration.IsZero() {
+			fi, err = os.Lstat(fnam)
+		} else {
+			fi, err = metadataFile.Stat()
+		}
+
 		if err != nil {
 			_ = tarWriter.Close()
 			d.logger.Debug("Error statting during export", logger.Ctx{"fileName": fnam})
@@ -6696,13 +6915,8 @@ func (d *qemu) Export(w io.Writer, properties map[string]string, expiration time
 			return meta, err
 		}
 
-		if properties != nil || !expiration.IsZero() {
-			tmpOffset := len(filepath.Dir(fnam)) + 1
-			err = tarWriter.WriteFile(fnam[tmpOffset:], fnam, fi, false)
-		} else {
-			err = tarWriter.WriteFile(fnam[offset:], fnam, fi, false)
-		}
-
+		// In both sub-cases the desired tar entry name is always "metadata.yaml".
+		err = tarWriter.WriteFile("metadata.yaml", fnam, fi, false)
 		if err != nil {
 			_ = tarWriter.Close()
 			d.logger.Debug("Error writing to tarfile", logger.Ctx{"err": err})
@@ -8488,7 +8702,7 @@ func (d *qemu) CanMigrate() (canMigrate bool, live bool) {
 	return d.canMigrate(d)
 }
 
-// LockExclusive attempts to get exlusive access to the instance's root volume.
+// LockExclusive attempts to get exclusive access to the instance's root volume.
 func (d *qemu) LockExclusive() (*operationlock.InstanceOperation, error) {
 	if d.IsRunning() {
 		return nil, errors.New("Instance is running")

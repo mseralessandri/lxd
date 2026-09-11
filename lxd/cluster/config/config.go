@@ -279,6 +279,39 @@ func (c *Config) Dump() map[string]string {
 	return c.m.Dump()
 }
 
+// DumpPublic returns a map of publicly visible configuration keys and values ready to add to the public (or non-admin)
+// API response.
+func (c *Config) DumpPublic(trusted bool) map[string]any {
+	conf := make(map[string]any, 4)
+	issuer, _, _, _, audience, _, deviceClientID := c.OIDCServer()
+	if issuer != "" && deviceClientID != "" {
+		conf["oidc.issuer"] = issuer
+		conf["oidc.device.client.id"] = deviceClientID
+		if audience != "" {
+			conf["oidc.audience"] = audience
+		}
+	}
+
+	userMicrocloud := c.m.GetString("user.microcloud")
+	if userMicrocloud != "" {
+		conf["user.microcloud"] = userMicrocloud
+	}
+
+	if trusted {
+		clusterUUID := c.ClusterUUID()
+		if clusterUUID != "" {
+			conf["volatile.uuid"] = clusterUUID
+		}
+	}
+
+	// Return nil if no public configuration.
+	if len(conf) == 0 {
+		return nil
+	}
+
+	return conf
+}
+
 // Replace the current configuration with the given values.
 //
 // Return what has actually changed.
@@ -771,7 +804,7 @@ var ConfigSchema = config.Schema{
 		// For example, `1d 3H` is 1 day and 3 hours.
 		//
 		// The default value is `1w` (1 week).
-		// The minimum value is `1d` (1 day).
+		// The minimum value is `1H` (1 hour).
 		// ---
 		//  type: string
 		//  scope: global

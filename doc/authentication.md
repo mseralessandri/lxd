@@ -33,6 +33,7 @@ On the next connection, a new certificate is generated.
 ### Communication protocol
 
 The supported protocol must be TLS 1.3 or better.
+LXD uses the [Go TLS stack](https://pkg.go.dev/crypto/tls) as the TLS implementation.
 
 All communications must use perfect forward secrecy, and ciphers must be limited to strong elliptic curve ones (such as ECDHE-RSA or ECDHE-ECDSA).
 
@@ -286,14 +287,20 @@ backend lxd_cluster_tcp
 (authentication-bearer)=
 ## Bearer token authentication
 
-LXD supports authenticating to the LXD API using bearer tokens. Bearer tokens provide a secure and temporary way to authenticate API requests without requiring client certificates.
+LXD supports authenticating to the LXD API using bearer tokens. Bearer tokens provide a secure way to authenticate API requests without requiring {ref}`client certificates <authentication-trusted-clients>` or {ref}`OpenID Connect configuration <authentication-openid>`.
 
 Bearer tokens can be issued for identities of type `bearer`. The permissions associated with a token are derived from the identity it belongs to and are enforced through {ref}`fine-grained-authorization`.
+
+A bearer identity is created in a pending state, with the type `Client token bearer (pending)` or `DevLXD token bearer (pending)`.
+Issuing a bearer token activates the identity and its type changes to `Client token bearer` or `DevLXD token bearer`, respectively.
+Revoking the token removes it and returns the identity to the pending state.
+An expired token remains associated with the identity.
+Therefore, the identity remains active, even though its token can no longer be used for authentication.
 
 To authenticate an API request using a bearer token, include it in the `Authorization` header
 as `Authorization: Bearer <token>`, where `<token>` represents an actual token value.
 
-By default, bearer tokens expire after 24 hours, unless they are manually revoked.
+By default, bearer tokens expire after 10 years, unless they are manually revoked.
 The expiration time can be customized when issuing the token.
 
 See {ref}`howto-auth-bearer` to learn how to issue and use bearer token in LXD.

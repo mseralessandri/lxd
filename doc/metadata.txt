@@ -32,6 +32,20 @@ User keys can be used in search.
 A comma-separated list of cluster link member addresses.
 ```
 
+```{config:option} volatile.pending_address cluster-link-volatile-conf
+:scope: "global"
+:shortdesc: "Pending public cluster link address."
+:type: "string"
+The address that was contacted and verified for a pending public cluster link, awaiting confirmation.
+```
+
+```{config:option} volatile.pending_certificate cluster-link-volatile-conf
+:scope: "global"
+:shortdesc: "Pending public cluster link certificate."
+:type: "string"
+The PEM-encoded certificate fetched for a pending public cluster link, awaiting confirmation.
+```
+
 <!-- config group cluster-link-volatile-conf end -->
 <!-- config group cluster-link-properties start -->
 ```{config:option} config cluster-link-properties
@@ -206,18 +220,18 @@ See the Linux Kernel [shared subtree](https://www.kernel.org/doc/Documentation/f
 ```{config:option} required device-disk-device-conf
 :defaultdesc: "`true`"
 :required: "no"
-:shortdesc: "Whether to fail if the source doesn’t exist"
+:shortdesc: "Whether to fail instance start if the source doesn’t exist"
 :type: "bool"
 
 ```
 
 ```{config:option} shift device-disk-device-conf
-:condition: "container"
 :defaultdesc: "`false`"
 :required: "no"
 :shortdesc: "Whether to set up a UID/GID shifting overlay"
 :type: "bool"
-If enabled, this option sets up a shifting overlay to translate the source UID/GID to match the container instance.
+For containers, if enabled, this option sets up a shifting overlay to translate the source UID/GID to match the instance.
+For virtual machines, the source UID/GID is passed through unchanged, even if the instance `raw.idmap` is set.
 ```
 
 ```{config:option} size device-disk-device-conf
@@ -1938,42 +1952,6 @@ User keys can be used in search.
 ```
 
 <!-- config group instance-miscellaneous end -->
-<!-- config group instance-nvidia start -->
-```{config:option} nvidia.driver.capabilities instance-nvidia
-:condition: "container"
-:defaultdesc: "`compute,utility`"
-:liveupdate: "no"
-:shortdesc: "What driver capabilities the instance needs"
-:type: "string"
-The specified driver capabilities are used to set `libnvidia-container NVIDIA_DRIVER_CAPABILITIES`.
-```
-
-```{config:option} nvidia.require.cuda instance-nvidia
-:condition: "container"
-:liveupdate: "no"
-:shortdesc: "Required CUDA version"
-:type: "string"
-The specified version expression is used to set `libnvidia-container NVIDIA_REQUIRE_CUDA`.
-```
-
-```{config:option} nvidia.require.driver instance-nvidia
-:condition: "container"
-:liveupdate: "no"
-:shortdesc: "Required driver version"
-:type: "string"
-The specified version expression is used to set `libnvidia-container NVIDIA_REQUIRE_DRIVER`.
-```
-
-```{config:option} nvidia.runtime instance-nvidia
-:condition: "container"
-:defaultdesc: "`false`"
-:liveupdate: "no"
-:shortdesc: "Whether to pass the host NVIDIA and CUDA runtime libraries into the instance"
-:type: "bool"
-
-```
-
-<!-- config group instance-nvidia end -->
 <!-- config group instance-placement start -->
 ```{config:option} placement.group instance-placement
 :liveupdate: "yes"
@@ -1991,6 +1969,7 @@ used to determine eligible cluster members during LXD scheduling events.
 :shortdesc: "AppArmor profile entries"
 :type: "blob"
 The specified entries are appended to the generated profile.
+This is a low-level option and is not recommended for production use, as it allows for unsupported configurations that may cease to work in future versions.
 ```
 
 ```{config:option} raw.idmap instance-raw
@@ -2005,7 +1984,8 @@ For example: `both 1000 1000`
 :liveupdate: "no"
 :shortdesc: "Raw LXC configuration to be appended to the generated one"
 :type: "blob"
-
+Additional LXC configuration is appended to the generated configuration.
+This is a low-level option and is not recommended for production use, as it allows for unsupported configurations that may cease to work in future versions.
 ```
 
 ```{config:option} raw.qemu instance-raw
@@ -2013,7 +1993,8 @@ For example: `both 1000 1000`
 :liveupdate: "no"
 :shortdesc: "Raw QEMU configuration to be appended to the generated command line"
 :type: "blob"
-
+Additional QEMU command line configuration is appended to the generated command line.
+This is a low-level option and is not recommended for production use, as it allows for unsupported configurations that may cease to work in future versions.
 ```
 
 ```{config:option} raw.qemu.conf instance-raw
@@ -2021,6 +2002,7 @@ For example: `both 1000 1000`
 :liveupdate: "no"
 :shortdesc: "Addition/override to the generated `qemu.conf` file"
 :type: "blob"
+This is a low-level option and is not recommended for production use, as it allows for unsupported configurations that may cease to work in future versions.
 See {ref}`instance-options-qemu` for more information.
 ```
 
@@ -2029,7 +2011,8 @@ See {ref}`instance-options-qemu` for more information.
 :liveupdate: "no"
 :shortdesc: "Raw Seccomp configuration"
 :type: "blob"
-
+Additional Seccomp configuration is appended to the generated policy.
+This is a low-level option and is not recommended for production use, as it allows for unsupported configurations that may cease to work in future versions.
 ```
 
 <!-- config group instance-raw end -->
@@ -3272,7 +3255,8 @@ Specify a comma-separated list of IPv6 CIDR subnets.
 :scope: "global"
 :shortdesc: "Additional `dnsmasq` configuration to append to the configuration file"
 :type: "string"
-
+Additional `dnsmasq` configuration is appended to the generated configuration file.
+This is a low-level option and is not recommended for production use, as it allows for unsupported configurations that may cease to work in future versions.
 ```
 
 ```{config:option} security.acls network-bridge-network-conf
@@ -4200,7 +4184,7 @@ This setting applies to both images and image aliases.
 :initialvaluedesc: "`false`"
 :shortdesc: "Whether to use a separate set of networks for the project"
 :type: "bool"
-
+This feature requires `features.profiles` to be enabled.
 ```
 
 ```{config:option} features.networks.zones project-features
@@ -4382,7 +4366,7 @@ When set to `allow`, {config:option}`instance-security:security.nesting` can be 
 :type: "string"
 Possible values are `unprivileged`, `isolated`, and `allow`.
 
-- When set to `unpriviliged`, this option prevents setting {config:option}`instance-security:security.privileged` to `true`.
+- When set to `unprivileged`, this option prevents setting {config:option}`instance-security:security.privileged` to `true`.
 - When set to `isolated`, this option prevents setting {config:option}`instance-security:security.privileged` to `true` and forces using a unique idmap per container using {config:option}`instance-security:security.idmap.isolated` set to `true`.
 - When set to `allow`, there is no restriction.
 ```
@@ -4602,13 +4586,6 @@ Required when creating a replicator.
 :shortdesc: "Cron expression for the replication schedule."
 :type: "string"
 Specify a cron expression for the replication schedule. For example, `@daily` or `0 6 * * *`.
-```
-
-```{config:option} snapshot replicator-conf
-:scope: "global"
-:shortdesc: "Whether to snapshot instances before replication."
-:type: "bool"
-
 ```
 
 <!-- config group replicator-conf end -->
@@ -5170,7 +5147,7 @@ where `S` is seconds, `M` is minutes, `H` is hours, `d` is days, `w` is weeks, `
 For example, `1d 3H` is 1 day and 3 hours.
 
 The default value is `1w` (1 week).
-The minimum value is `1d` (1 day).
+The minimum value is `1H` (1 hour).
 ```
 
 <!-- config group server-oidc end -->
@@ -5182,7 +5159,7 @@ The minimum value is `1d` (1 day).
 ```
 
 ```{config:option} alletra.mode storage-alletra-pool-conf
-:defaultdesc: "the discovered mode"
+:defaultdesc: "`nvme/tcp`"
 :shortdesc: "How volumes are mapped to the local server"
 :type: "string"
 The mode to use to map storage volumes to the local server.
@@ -5190,7 +5167,7 @@ Supported values are `iscsi` and `nvme/tcp`.
 ```
 
 ```{config:option} alletra.target storage-alletra-pool-conf
-:defaultdesc: "the discovered mode"
+:defaultdesc: "all available targets"
 :shortdesc: "List of target addresses."
 :type: "string"
 A comma-separated list of target addresses. If empty, LXD discovers and connects to all available targets. Otherwise, it only connects to the specified addresses.
@@ -6369,7 +6346,7 @@ This option is required only if {config:option}`storage-powerflex-pool-conf:powe
 ```
 
 ```{config:option} powerflex.mode storage-powerflex-pool-conf
-:defaultdesc: "the discovered mode"
+:defaultdesc: "`nvme/tcp`"
 :scope: "global"
 :shortdesc: "How volumes are mapped to the local server"
 :type: "string"
@@ -6602,17 +6579,16 @@ Specify either a cron expression (`<minute> <hour> <dom> <month> <dow>`), a comm
 ```
 
 ```{config:option} powerstore.mode storage-powerstore-pool-conf
-:defaultdesc: "the discovered mode"
-:required: "true"
+:defaultdesc: "`nvme/tcp`"
 :scope: "global"
 :shortdesc: "How volumes are mapped to the local server"
 :type: "string"
 The mode to use to map PowerStore volumes to the local server.
-Supported values are `iscsi` and `scsi/fc`.
+Supported values are `iscsi`, `scsi/fc`, and `nvme/tcp`.
 ```
 
 ```{config:option} powerstore.target storage-powerstore-pool-conf
-:defaultdesc: "target addresses"
+:defaultdesc: "all available targets"
 :shortdesc: "List of target addresses the LXD connects to."
 :type: "string"
 A comma-separated list of target addresses. If empty, LXD discovers and connects to all available targets. Otherwise, it only connects to the specified addresses.
@@ -6804,7 +6780,7 @@ API authorization token for Pure Storage gateway. Must have array_admin role to 
 ```
 
 ```{config:option} pure.mode storage-pure-pool-conf
-:defaultdesc: "the discovered mode"
+:defaultdesc: "`nvme/tcp`"
 :shortdesc: "How volumes are mapped to the local server"
 :type: "string"
 The mode to use to map Pure Storage volumes to the local server.
@@ -6812,7 +6788,7 @@ Supported values are `iscsi` and `nvme/tcp`.
 ```
 
 ```{config:option} pure.target storage-pure-pool-conf
-:defaultdesc: "the discovered mode"
+:defaultdesc: "all available targets"
 :shortdesc: "List of target addresses."
 :type: "string"
 A comma-separated list of target addresses. If empty, LXD discovers and connects to all available targets. Otherwise, it only connects to the specified addresses.

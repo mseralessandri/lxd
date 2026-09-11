@@ -233,6 +233,10 @@ type APIEndpoint struct {
 	Delete      APIEndpointAction
 	Patch       APIEndpointAction
 
+	// ProjectSpecific indicates that the endpoint manages project specific resources.
+	// This is used for global authorization checks.
+	ProjectSpecific bool
+
 	// EndpointResolver optionally resolves this endpoint to a more specific sub-endpoint based on the
 	// request path. This is used when multiple logical endpoints share a single ServeMux pattern to avoid
 	// pattern conflicts (e.g. images/aliases/{name...} vs images/{fingerprint}/export). When set, createCmd
@@ -242,11 +246,27 @@ type APIEndpoint struct {
 
 // APIEndpointAction represents an action on an API endpoint.
 type APIEndpointAction struct {
-	Handler        func(d *Daemon, r *http.Request) response.Response
-	AccessHandler  func(d *Daemon, r *http.Request) response.Response
-	AllowUntrusted bool
-	ContentTypes   []string // Client content types to allow.
+	Handler         func(d *Daemon, r *http.Request) response.Response
+	AccessHandler   func(d *Daemon, r *http.Request) response.Response
+	AllowUntrusted  bool
+	AllProjectsMode allProjectsMode
+	ContentTypes    []string // Client content types to allow.
 }
+
+// allProjectsMode dictates how the all-projects query parameter is handled if present.
+type allProjectsMode uint8
+
+const (
+	// allProjectsModeNotSupported is the default (zero) value.
+	allProjectsModeNotSupported allProjectsMode = iota
+
+	// allProjectsModeDisallowRestrictedTLSClients is used to prevent restricted TLS clients from querying resources
+	// across all projects. This is to maintain legacy behaviour and can be removed when restricted TLS clients are removed.
+	allProjectsModeDisallowRestrictedTLSClients
+
+	// allProjectsModeAllowAll allows all (authenticated) callers to use the all projects query parameter.
+	allProjectsModeAllowAll
+)
 
 // allowAuthenticated is an AccessHandler which allows only authenticated requests. This should be used in conjunction
 // with further access control within the handler (e.g. to filter resources the user is able to view/edit).
@@ -302,76 +322,6 @@ func allowPermission(entityType entity.Type, entitlement auth.Entitlement, muxVa
 		err = s.Authorizer.CheckPermission(r.Context(), entityURL, entitlement)
 		if err != nil {
 			return response.SmartError(err)
-		}
-
-		return response.EmptySyncResponse
-	}
-}
-
-// allowProjectResourceList should be used instead of allowAuthenticated when listing resources within a project.
-// This prevents a restricted TLS client from listing resources in a project that they do not have access to.
-// The allowAllProjects parameter controls whether usage of the "all-projects" query parameter is allowed for restricted TLS clients.
-func allowProjectResourceList(allowAllProjects bool) func(d *Daemon, r *http.Request) response.Response {
-	return func(d *Daemon, r *http.Request) response.Response {
-		requestor, err := request.GetRequestor(r.Context())
-		if err != nil {
-			return response.SmartError(err)
-		}
-
-		// The caller must be authenticated.
-		if !requestor.IsTrusted() {
-			return response.Forbidden(nil)
-		}
-
-		// A root user can list resources in any project.
-		if requestor.IsAdmin() {
-			return response.EmptySyncResponse
-		}
-
-		idType, err := requestor.CallerIdentityType()
-		if err != nil {
-			return response.SmartError(err)
-		}
-
-		requestProjectName, allProjects, err := request.ProjectParams(r)
-		if err != nil {
-			return response.SmartError(err)
-		}
-
-		if idType.IsFineGrained() {
-			if allProjects {
-				return response.EmptySyncResponse
-			}
-
-			s := d.State()
-
-			// Fine-grained clients must be able to view the containing project.
-			err = s.Authorizer.CheckPermission(r.Context(), entity.ProjectURL(requestProjectName), auth.EntitlementCanView)
-			if err != nil {
-				return response.SmartError(err)
-			}
-
-			return response.EmptySyncResponse
-		}
-
-		// We should now only be left with restricted client certificates. Metrics certificates should have been disregarded
-		// already, because they cannot call any endpoint other than /1.0/metrics (which is enforced during authentication).
-		if idType.Name() != api.IdentityTypeCertificateClientRestricted {
-			return response.InternalError(fmt.Errorf("Encountered unexpected identity type %q listing resources", idType.Name()))
-		}
-
-		// all-projects requests may not be allowed, depending on the handler.
-		if allProjects {
-			if allowAllProjects {
-				return response.EmptySyncResponse
-			}
-
-			return response.Forbidden(errors.New("Certificate is restricted"))
-		}
-
-		// Disallow listing resources in projects the caller does not have access to.
-		if !slices.Contains(requestor.CallerAllowedProjectNames(), requestProjectName) {
-			return response.Forbidden(errors.New("Certificate is restricted"))
 		}
 
 		return response.EmptySyncResponse
@@ -1021,50 +971,7 @@ func (d *Daemon) createCmd(restAPI *http.ServeMux, version string, c APIEndpoint
 			return
 		}
 
-		handleRequest := func(action APIEndpointAction) response.Response {
-			// Protect against CSRF when using LXD-UI with browser that supports Fetch metadata.
-			// Deny Sec-Fetch-Site when set to cross-site or same-site.
-			if http.NewCrossOriginProtection().Check(r) != nil {
-				return response.ErrorResponse(http.StatusForbidden, "Forbidden Sec-Fetch-Site header value")
-			}
-
-			if len(action.ContentTypes) == 0 {
-				// Require application/json if not specified by handler.
-				action.ContentTypes = []string{"application/json"}
-			}
-
-			// Validate browser Content-Type if supplied, or if non-zero Content-Length supplied.
-			if isBrowserClient(r) {
-				contentTypeParts := shared.SplitNTrimSpace(r.Header.Get("Content-Type"), ";", 2, false) // Ignore multi-part boundary part.
-				contentLength := r.Header.Get("Content-Length")
-				hasContentLength := contentLength != "" && contentLength != "0"
-				if (hasContentLength || contentTypeParts[0] != "") && !slices.Contains(action.ContentTypes, contentTypeParts[0]) {
-					return response.ErrorResponse(http.StatusUnsupportedMediaType, "Unsupported Content-Type for this request")
-				}
-			}
-
-			// All APIEndpointActions should have an access handler or should allow untrusted requests.
-			if action.AccessHandler == nil && !action.AllowUntrusted {
-				return response.InternalError(fmt.Errorf("Access handler not defined for %s %s", r.Method, r.URL.RequestURI()))
-			}
-
-			// If the request is not trusted, only call the handler if the action allows it.
-			if !requestor.Trusted && !action.AllowUntrusted {
-				return response.Forbidden(errors.New("You must be authenticated"))
-			}
-
-			// Call the access handler if there is one.
-			if action.AccessHandler != nil {
-				resp := action.AccessHandler(d, r)
-				if resp != response.EmptySyncResponse {
-					return resp
-				}
-			}
-
-			return action.Handler(d, r)
-		}
-
-		resp = handleRequest(endpointAction)
+		resp = handleRequest(d, r, endpointAction, endpoint.ProjectSpecific)
 
 		// Handle errors
 		err = resp.Render(w, r)
@@ -1075,6 +982,88 @@ func (d *Daemon) createCmd(restAPI *http.ServeMux, version string, c APIEndpoint
 			}
 		}
 	})
+}
+
+// handleRequest is called from the HTTP handler func defined in (*Daemon).createCmd for all API endpoint actions.
+func handleRequest(d *Daemon, r *http.Request, action APIEndpointAction, projectSpecific bool) response.Response {
+	// Protect against CSRF when using LXD-UI with browser that supports Fetch metadata.
+	// Deny Sec-Fetch-Site when set to cross-site or same-site.
+	if http.NewCrossOriginProtection().Check(r) != nil {
+		return response.ErrorResponse(http.StatusForbidden, "Forbidden Sec-Fetch-Site header value")
+	}
+
+	contentTypes := action.ContentTypes
+	if len(contentTypes) == 0 {
+		// Require application/json if not specified by handler.
+		contentTypes = []string{"application/json"}
+	}
+
+	// Validate browser Content-Type if supplied, or if non-zero Content-Length supplied.
+	if isBrowserClient(r) {
+		contentTypeParts := shared.SplitNTrimSpace(r.Header.Get("Content-Type"), ";", 2, false) // Ignore multi-part boundary part.
+		contentLength := r.Header.Get("Content-Length")
+		hasContentLength := contentLength != "" && contentLength != "0"
+		if (hasContentLength || contentTypeParts[0] != "") && !slices.Contains(contentTypes, contentTypeParts[0]) {
+			return response.ErrorResponse(http.StatusUnsupportedMediaType, "Unsupported Content-Type for this request")
+		}
+	}
+
+	// All APIEndpointActions should have an access handler or should allow untrusted requests.
+	if action.AccessHandler == nil && !action.AllowUntrusted {
+		return response.InternalError(fmt.Errorf("Access handler not defined for %s %s", r.Method, r.URL.RequestURI()))
+	}
+
+	// Get the requestor.
+	requestor, err := request.GetRequestor(r.Context())
+	if err != nil {
+		return response.SmartError(err)
+	}
+
+	// If the request is not trusted, only call the handler if the action allows it.
+	if !requestor.IsTrusted() && !action.AllowUntrusted {
+		return response.Forbidden(errors.New("You must be authenticated"))
+	}
+
+	// Global permission checks applied for project specific endpoints.
+	// This can only be globally applied for trusted endpoints.
+	// Endpoints that allow untrusted requests must enforce the project check themselves.
+	if projectSpecific && !action.AllowUntrusted {
+		projectName, allProjects, err := request.ProjectParams(r)
+		if err != nil {
+			return response.SmartError(err)
+		}
+
+		if allProjects {
+			// Handle all-projects query parameter according to endpoint action specified mode.
+			// The default value if unspecified is allProjectsModeNotSupported.
+			switch action.AllProjectsMode {
+			case allProjectsModeNotSupported:
+				return response.BadRequest(errors.New("All projects queries are not supported"))
+			case allProjectsModeDisallowRestrictedTLSClients:
+				if requestor.IsIdentityType(api.IdentityTypeCertificateClientRestricted) {
+					return response.Forbidden(errors.New("Certificate is restricted"))
+				}
+
+			case allProjectsModeAllowAll:
+			}
+		} else {
+			// Check that the caller can view the requested project.
+			err = d.authorizer.CheckPermission(r.Context(), entity.ProjectURL(projectName), auth.EntitlementCanView)
+			if err != nil {
+				return response.SmartError(err)
+			}
+		}
+	}
+
+	// Call the access handler if there is one.
+	if action.AccessHandler != nil {
+		resp := action.AccessHandler(d, r)
+		if resp != response.EmptySyncResponse {
+			return resp
+		}
+	}
+
+	return action.Handler(d, r)
 }
 
 // have we setup shared mounts?
@@ -1186,13 +1175,19 @@ func (d *Daemon) setupLoki(URL string, cert string, key string, caCert string, i
 	return nil
 }
 
-func (d *Daemon) init() error {
+func (d *Daemon) init() (err error) {
 	d.startStopLock.Lock()
 	defer d.startStopLock.Unlock()
 
-	var dbWarnings []dbCluster.Warning
+	defer func() {
+		if err != nil {
+			// Use context.Background() rather than d.shutdownCtx because a shutdown
+			// may be the reason init() failed, in which case d.shutdownCtx is already cancelled.
+			shared.SnapSetHealth(context.Background(), shared.SnapHealthError, "LXD daemon failed to start")
+		}
+	}()
 
-	var err error
+	var dbWarnings []dbCluster.Warning
 
 	// Set default authorizer.
 	d.authorizer, err = authDrivers.LoadAuthorizer(d.shutdownCtx, authDrivers.DriverTLS, logger.Log, authDrivers.WithSendSecurity(d.events.SendSecurity))
@@ -1609,6 +1604,7 @@ func (d *Daemon) init() error {
 			// now fine, and then retry
 			logger.Warn("Wait for other cluster members to align their versions, cluster not started yet")
 
+			shared.SnapSetHealth(d.shutdownCtx, shared.SnapHealthWaiting, "Waiting for cluster members to align their versions after snap refresh")
 			// The only thing we want to still do on this node is
 			// to run the heartbeat task, in case we are the raft
 			// leader.
@@ -1941,6 +1937,11 @@ func (d *Daemon) init() error {
 			return fmt.Errorf("Failed loading local instances: %w", err)
 		}
 
+		err = patchesApply(d, patchPostInstancesLoaded)
+		if err != nil {
+			return err
+		}
+
 		// Register devices on running instances to receive events and reconnect to VM monitor sockets.
 		// This should come after the event handler go routines have been started.
 		devicesRegister(instances)
@@ -2042,6 +2043,12 @@ func (d *Daemon) init() error {
 
 		// Run scheduled replicators (minutely check of configurable cron expression)
 		d.tasks.Add(runScheduledReplicatorsTask(d.State))
+
+		// Synchronize operations with the database (minutely)
+		d.tasks.Add(synchronizeOperationsTask(d.State))
+
+		// Refresh cluster link volatile addresses (daily).
+		d.tasks.Add(autoRefreshClusterLinkVolatileAddressesTask(d.State))
 	}
 
 	// Load Ubuntu Pro configuration before starting any instances.
@@ -2065,6 +2072,7 @@ func (d *Daemon) init() error {
 
 	logger.Info("Daemon started")
 
+	shared.SnapSetHealth(d.shutdownCtx, shared.SnapHealthOkay, "")
 	return nil
 }
 
@@ -2093,12 +2101,12 @@ func (d *Daemon) requestorHook(ctx context.Context, authenticationMethod string,
 
 		// If not fine-grained, get the project list.
 		if !idType.IsFineGrained() {
-			dbProjects, err := dbCluster.GetCertificateLegacyProjects(ctx, tx.Tx(), &id.ID)
+			dbProjects, err := dbCluster.GetCertificateLegacyProjectsWithFeatures(ctx, tx.Tx(), id.ID)
 			if err != nil {
 				return fmt.Errorf("Failed getting projects for identity: %w", err)
 			}
 
-			res.Projects = dbProjects[id.ID]
+			res.Projects = dbProjects
 			return nil
 		}
 
@@ -2154,17 +2162,11 @@ func (d *Daemon) startClusterTasks() {
 	// Remove orphaned operations
 	d.clusterTasks.Add(autoRemoveOrphanedOperationsTask(d.State))
 
-	// Prune expired operations from the database (hourly)
-	d.clusterTasks.Add(pruneExpiredOperationsTask(d.State))
-
 	// Perform automatic evacuation for offline cluster members
 	d.clusterTasks.Add(autoHealClusterTask(d.State, d.gateway))
 
 	// Remove expired OIDC sessions
 	d.clusterTasks.Add(pruneExpiredOIDCSessionsTask(d.State))
-
-	// Refresh cluster link volatile addresses (daily).
-	d.clusterTasks.Add(autoRefreshClusterLinkVolatileAddressesTask(d.State))
 
 	// Start all background tasks
 	d.clusterTasks.Start(d.shutdownCtx)
@@ -2195,7 +2197,7 @@ func (d *Daemon) numRunningInstances(instances []instance.Instance) int {
 func cancelCancelableOps(ctx context.Context) error {
 	ops := operations.Clone()
 	for _, op := range ops {
-		op.Cancel()
+		_ = op.Cancel()
 		_ = op.Wait(ctx)
 	}
 
@@ -2220,7 +2222,12 @@ func (d *Daemon) Stop(ctx context.Context, sig os.Signal) error {
 
 	s := d.State()
 
-	if d.gateway != nil {
+	// Skip the member-role handover if the cluster DB never opened (e.g. init()
+	// failed between gateway creation and db.OpenCluster): there is no
+	// membership state to hand over, and handoverMemberRole would dereference
+	// the nil cluster DB. The gateway itself is still torn down below via
+	// Kill() and Shutdown().
+	if d.gateway != nil && d.db.Cluster != nil {
 		d.stopClusterTasks()
 
 		err := handoverMemberRole(d.State(), d.gateway)
@@ -2732,15 +2739,23 @@ func (d *Daemon) nodeRefreshTask(heartbeatData *cluster.APIHeartbeat, isLeader b
 	if isLeader && unavailableMembers != nil && len(heartbeatData.Members) > 1 {
 		offlineMemberIDs := d.handleHeartbeatClusterRoleChanges(heartbeatData, unavailableMembers, localClusterAddress)
 
-		// On initial heartbeat, if there are offline nodes (whether part of raft or not) delete any orphaned operations
-		// that may be present there. After the initial heartbeat, this is handled by the autoRemoveOrphanedOperationsTask.
-		// It can't be performed at startup in case of stale member state, which can lead to operations being erroneously removed.
-		if mode == cluster.HeartbeatInitial && len(offlineMemberIDs) > 0 {
-			err = d.db.Cluster.Transaction(d.shutdownCtx, func(ctx context.Context, tx *db.ClusterTx) error {
-				return dbCluster.ClearStaleOperationsFromNodes(ctx, tx.Tx(), offlineMemberIDs...)
-			})
+		if len(offlineMemberIDs) > 0 {
+			// On initial heartbeat, if there are offline nodes (whether part of raft or not) delete any orphaned operations
+			// that may be present there. After the initial heartbeat, this is handled by the autoRemoveOrphanedOperationsTask.
+			// It can't be performed at startup in case of stale member state, which can lead to operations being erroneously removed.
+			if mode == cluster.HeartbeatInitial {
+				err = d.db.Cluster.Transaction(d.shutdownCtx, func(ctx context.Context, tx *db.ClusterTx) error {
+					return dbCluster.ClearStaleOperationsFromNodes(ctx, tx.Tx(), offlineMemberIDs...)
+				})
+				if err != nil {
+					logger.Warn("Could not remove orphaned operations from offline members after initial heartbeat round", logger.Ctx{"err": err, "local": localClusterAddress})
+				}
+			}
+
+			// For any heartbeat, if there are offline cluster members running durable operations, we need to restart them here.
+			err = operations.RestartDurableOperationsFromNodes(s.ShutdownCtx, s, offlineMemberIDs...)
 			if err != nil {
-				logger.Warn("Could not remove orphaned operations from offline members after initial heartbeat round", logger.Ctx{"err": err, "local": localClusterAddress})
+				logger.Warn("Could not restart durable operations from offline members", logger.Ctx{"err": err, "offlineMemberIDs": offlineMemberIDs})
 			}
 		}
 	}

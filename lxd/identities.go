@@ -416,12 +416,19 @@ func identitiesBearerPost(d *Daemon, r *http.Request) response.Response {
 		return response.Forbidden(errors.New("Initial UI identities may only be created via unix socket"))
 	}
 
+	// A bearer identity is created in pending state as no token has been issued for it yet.
+	// It is promoted to its active type when a token is first issued.
+	identityType, err := dbCluster.IdentityType(req.Type).PendingType()
+	if err != nil {
+		return response.BadRequest(fmt.Errorf("Identity type %q cannot be created: %w", req.Type, err))
+	}
+
 	newIdentityID := uuid.New()
 	err = s.DB.Cluster.Transaction(r.Context(), func(ctx context.Context, tx *db.ClusterTx) error {
 		// Create the identity.
 		id, err := query.Create(ctx, tx.Tx(), dbCluster.IdentitiesRow{
 			AuthMethod: api.AuthenticationMethodBearer,
-			Type:       dbCluster.IdentityType(req.Type),
+			Type:       identityType,
 			Identifier: newIdentityID.String(),
 			Name:       req.Name,
 		})
@@ -473,7 +480,25 @@ func identitiesBearerPost(d *Daemon, r *http.Request) response.Response {
 //	      $ref: "#/definitions/IdentityBearerTokenPost"
 //	responses:
 //	  "200":
-//	    $ref: "#/responses/IdentityBearerToken"
+//	    description: API endpoints
+//	    schema:
+//	      type: object
+//	      description: Sync response
+//	      properties:
+//	        type:
+//	          type: string
+//	          description: Response type
+//	          example: sync
+//	        status:
+//	          type: string
+//	          description: Status description
+//	          example: Success
+//	        status_code:
+//	          type: integer
+//	          description: Status code
+//	          example: 200
+//	        metadata:
+//	          $ref: "#/definitions/IdentityBearerToken"
 //	  "400":
 //	    $ref: "#/responses/BadRequest"
 //	  "403":
@@ -499,7 +524,7 @@ func identityBearerTokenPost(d *Daemon, r *http.Request) response.Response {
 		return response.SmartError(err)
 	}
 
-	if id.Type == api.IdentityTypeBearerTokenInitialUI {
+	if identity.IsInitialUIBearer(string(id.Type)) {
 		if requestor.Protocol != request.ProtocolUnix {
 			return response.Forbidden(errors.New("Initial UI identity tokens may only be issued via unix socket"))
 		}
@@ -525,12 +550,37 @@ func identityBearerTokenPost(d *Daemon, r *http.Request) response.Response {
 
 	var secret []byte
 	err = s.DB.Cluster.Transaction(r.Context(), func(ctx context.Context, tx *db.ClusterTx) error {
+		updated, err := dbCluster.GetIdentityByID(ctx, tx.Tx(), id.ID)
+		if err != nil {
+			return err
+		}
+
+		idType, err := identity.New(string(updated.Type))
+		if err != nil {
+			return err
+		}
+
 		secret, err = dbCluster.RotateBearerIdentitySigningKey(ctx, tx.Tx(), id.ID)
 		if err != nil {
 			return err
 		}
 
-		return nil
+		// Record the expiry alongside the new signing key so that it can be reported when the identity is listed.
+		err = updated.SetBearerTokenExpiry(&expiresAt)
+		if err != nil {
+			return err
+		}
+
+		// Promote a pending identity to its active type now that it has a usable token.
+		// Re-issuing a token for an already active identity leaves the type unchanged.
+		if idType.IsPending() {
+			updated.Type, err = updated.Type.ActiveType()
+			if err != nil {
+				return err
+			}
+		}
+
+		return query.UpdateByPrimaryKey(ctx, tx.Tx(), *updated)
 	})
 	if err != nil {
 		return response.SmartError(err)
@@ -538,7 +588,7 @@ func identityBearerTokenPost(d *Daemon, r *http.Request) response.Response {
 
 	var token string
 	switch id.Type {
-	case api.IdentityTypeBearerTokenClient, api.IdentityTypeBearerTokenInitialUI:
+	case api.IdentityTypeBearerTokenClient, api.IdentityTypeBearerTokenClientPending, api.IdentityTypeBearerTokenInitialUI, api.IdentityTypeBearerTokenInitialUIPending:
 		var serverCertFingerprint string
 
 		// When creating LXD bearer tokens, include the server certificate fingerprint.
@@ -548,7 +598,7 @@ func identityBearerTokenPost(d *Daemon, r *http.Request) response.Response {
 		}
 
 		token, err = encryption.GetClientBearerToken(secret, id.Identifier, s.GlobalConfig.ClusterUUID(), expiresAt, serverCertFingerprint)
-	case api.IdentityTypeBearerTokenDevLXD:
+	case api.IdentityTypeBearerTokenDevLXD, api.IdentityTypeBearerTokenDevLXDPending:
 		token, err = encryption.GetDevLXDBearerToken(secret, id.Identifier, s.GlobalConfig.ClusterUUID(), expiresAt)
 	default:
 		err = api.StatusErrorf(http.StatusBadRequest, "Token cannot be issued for identity of type %q", id.Type)
@@ -578,7 +628,7 @@ func identityBearerTokenPost(d *Daemon, r *http.Request) response.Response {
 	return response.SyncResponse(true, api.IdentityBearerToken{Token: token})
 }
 
-// swagger:operation POST /1.0/auth/identities/bearer/{nameOrID}/token identities identity_delete_bearer_token
+// swagger:operation DELETE /1.0/auth/identities/bearer/{nameOrID}/token identities identity_delete_bearer_token
 //
 //	Revoke a bearer identity token.
 //
@@ -605,12 +655,31 @@ func identityBearerTokenDelete(d *Daemon, r *http.Request) response.Response {
 	}
 
 	err = s.DB.Cluster.Transaction(r.Context(), func(ctx context.Context, tx *db.ClusterTx) error {
-		err := dbCluster.DeleteBearerIdentitySigningKey(ctx, tx.Tx(), id.ID)
+		// The access handler read its copy of the identity in an earlier transaction and the update below
+		// writes every column, so reload the row here and derive the type transition from committed state.
+		updated, err := dbCluster.GetIdentityByID(ctx, tx.Tx(), id.ID)
+		if err != nil {
+			return err
+		}
+
+		err = dbCluster.DeleteBearerIdentitySigningKey(ctx, tx.Tx(), id.ID)
 		if err != nil {
 			return fmt.Errorf("Failed revoking token: %w", err)
 		}
 
-		return nil
+		// Clear the recorded expiry so that the revoked token is no longer reported when the identity is listed.
+		err = updated.SetBearerTokenExpiry(nil)
+		if err != nil {
+			return err
+		}
+
+		// Demote the identity to its pending type now that it has no usable token.
+		updated.Type, err = updated.Type.PendingType()
+		if err != nil {
+			return err
+		}
+
+		return query.UpdateByPrimaryKey(ctx, tx.Tx(), *updated)
 	})
 	if err != nil {
 		return response.SmartError(err)
@@ -767,17 +836,22 @@ func createIdentityTLSTrusted(ctx context.Context, s *state.State, peerCertifica
 }
 
 func createCertificateAddToken(s *state.State, clientName string, identityType string) (*api.CertificateAddToken, error) {
-	localHTTPSAddress := s.LocalConfig.HTTPSAddress()
+	var addresses []string
+	var err error
+	if identityType == api.IdentityTypeCertificateClusterLink {
+		addresses, err = clusterLinkListenAddresses(s.ServerClustered, s.LocalConfig.HTTPSAddress(), s.LocalConfig.ClusterAddress())
+	} else {
+		localHTTPSAddress := s.LocalConfig.HTTPSAddress()
 
-	// Tokens are useless if the server isn't listening (how will the untrusted client contact the server?)
-	if localHTTPSAddress == "" {
-		return nil, api.NewStatusError(http.StatusBadRequest, "Cannot issue token when server is not listening on network")
+		// Tokens are useless if the server is not listening on the network.
+		if localHTTPSAddress == "" {
+			return nil, api.NewStatusError(http.StatusBadRequest, "Cannot issue token when server is not listening on network")
+		}
+
+		// Include all HTTPS listener addresses so clients can find a reachable endpoint.
+		addresses, err = util.ListenAddresses(localHTTPSAddress)
 	}
 
-	// Get all addresses the server is listening on. This is encoded in the certificate token,
-	// so that the client will not have to specify a server address. The client will iterate
-	// through all these addresses until it can connect to one of them.
-	addresses, err := util.ListenAddresses(localHTTPSAddress)
 	if err != nil {
 		return nil, err
 	}
@@ -1622,6 +1696,13 @@ func identityGetCurrent(d *Daemon, r *http.Request) response.Response {
 		return response.SmartError(err)
 	}
 
+	// Populate metadata expiry from the requestor. This ensures bearer tokens issued before their
+	// expiry was recorded have the field correctly populated from the authenticating token/request.
+	expiresAt := requestor.ExpiresAt()
+	if expiresAt != nil {
+		apiIdentity.ExpiresAt = expiresAt
+	}
+
 	effectivePermissions := make([]api.Permission, 0, len(permissions))
 	for _, permission := range permissions {
 		effectivePermissions = append(effectivePermissions, api.Permission{
@@ -1636,7 +1717,6 @@ func identityGetCurrent(d *Daemon, r *http.Request) response.Response {
 		EffectiveGroups:      effectiveGroups,
 		EffectivePermissions: effectivePermissions,
 		FineGrained:          identityType.IsFineGrained(),
-		ExpiresAt:            requestor.ExpiresAt(),
 	})
 }
 
@@ -2285,7 +2365,7 @@ func identityDelete(d *Daemon, r *http.Request) response.Response {
 		return response.SmartError(err)
 	}
 
-	if !identityType.IsFineGrained() && identityType.Name() != api.IdentityTypeBearerTokenInitialUI {
+	if !identityType.IsFineGrained() && !identity.IsInitialUIBearer(identityType.Name()) {
 		return response.NotImplemented(fmt.Errorf("Identities of type %q cannot be modified via this API", id.Type))
 	}
 
@@ -2504,7 +2584,7 @@ func updateIdentityCache(d *Daemon) {
 		} else if identityType.AuthenticationMethod() == api.AuthenticationMethodBearer {
 			secret, ok := bearerIdentitySecrets[id.ID]
 			if !ok {
-				// No need to add bearer identities with no secret to the cache, they cannot authenticate.
+				logger.Warn("Missing signing key for active bearer identity", logger.Ctx{"identity_identifier": id.Identifier})
 				continue
 			}
 

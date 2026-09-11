@@ -366,6 +366,48 @@ respawn_lxd_cluster_member() {
   LXD_NETNS="${1}" respawn_lxd "${2}" true
 }
 
+# Wait until the cluster reports an elected database-leader as seen from the provided LXD_DIR.
+# `lxd waitready` only confirms the API is responsive; immediately after a member restart the
+# cluster may still be electing a leader, causing cluster operations to fail with
+# "Failed getting the address of the cluster leader".
+wait_for_cluster_leader() {
+  local lxdDir="${1}"
+  local i members
+
+  for i in $(seq "${MAX_WAIT_SECONDS:-120}"); do
+    # `lxc cluster list` itself resolves the leader address so it can fail while electing.
+    members="$(CLIENT_DEBUG="" SHELL_TRACING="" LXD_DIR="${lxdDir}" lxc cluster list --format json 2>/dev/null || true)"
+    if [ -n "${members}" ] && jq --exit-status 'any(.[]; any(.roles[]; . == "database-leader"))' <<< "${members}" > /dev/null; then
+      return 0
+    fi
+
+    sleep 1
+  done
+
+  echo "Cluster leader not elected after ${i}s"
+  return 1
+}
+
+wait_all_members_online() {
+  local lxdDir="${1}"
+  local i members
+
+  for i in $(seq "${MAX_WAIT_SECONDS:-120}"); do
+    members="$(CLIENT_DEBUG="" SHELL_TRACING="" LXD_DIR="${lxdDir}" lxc cluster list --format json 2>/dev/null || true)"
+    if [ -n "${members}" ] && jq --exit-status 'all(.status == "Online")' <<< "${members}" > /dev/null; then
+      return 0
+    fi
+
+    sleep 1
+  done
+
+  echo "One or more cluster members did not come back online after ${i}s"
+
+  # Dump all members for debugging purposes.
+  echo "${members}"
+  return 1
+}
+
 is_uuid_v4() {
   # Case insensitive match for a v4 UUID. The third group must start with 4, and the fourth group must start with 8, 9,
   # a, or b. This accounts for the version and variant. See https://datatracker.ietf.org/doc/html/rfc9562#name-uuid-version-4.
@@ -376,4 +418,42 @@ is_uuid_v7() {
   # Case insensitive match for a v7 UUID. The third group must start with 7, and the fourth group must start with 8, 9,
   # a, or b. This accounts for the version and variant. See https://datatracker.ietf.org/doc/html/rfc9562#name-uuid-version-7.
   echo "${1}" | grep -ixE '[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}'
+}
+
+lxd_leader_name() {
+  local LXD_DIR="${1}"
+  LXD_DIR="${LXD_DIR}" lxc query /1.0/cluster/members?recursion=1 | jq --exit-status -r '.[] | select(.roles[] == "database-leader") | .server_name'
+}
+
+lxd_dir_from_name() {
+  local name="${1}"
+  lxd_dir_from_index "${name#node}"
+}
+
+lxd_dir_from_index() {
+  local index="${1}"
+  case "${index}" in
+    1)
+      echo "${LXD_ONE_DIR}";;
+    2)
+      echo "${LXD_TWO_DIR}";;
+    3)
+      echo "${LXD_THREE_DIR}";;
+    4)
+      echo "${LXD_FOUR_DIR}";;
+    5)
+      echo "${LXD_FIVE_DIR}";;
+    6)
+      echo "${LXD_SIX_DIR}";;
+    7)
+      echo "${LXD_SEVEN_DIR}";;
+    8)
+      echo "${LXD_EIGHT_DIR}";;
+    9)
+      echo "${LXD_NINE_DIR}";;
+    *)
+      echo "lxd_dir_from_index: Unknown cluster member index ${index}"
+      false
+      ;;
+  esac
 }

@@ -77,8 +77,7 @@ There are two ways to create a token.
 Create a *pending fine-grained TLS identity* if you would like to manage client permissions via {ref}`fine-grained-authorization`.
 Create a *certificate add token* if you would like to grant the client full access to LXD, or manage their permissions via {ref}`restricted-tls-certs`.
 
-See {ref}`access-ui` for instructions on how to authenticate with the LXD server using the UI.
-To authenticate a CLI or API client using a trust token, complete the following steps:
+To authenticate a client using a trust token, complete the following steps:
 
 1. On the server, generate a trust token.
 
@@ -162,7 +161,7 @@ To authenticate a CLI or API client using a trust token, complete the following 
        }'
 
    <!-- include start tls identity API -->
-   See [`POST /1.0/auth/identities/tls`](swagger:/auth/identitites/identities_post_tls) for more information.
+   See [`POST /1.0/auth/identities/tls`](swagger:/auth/identities/identities_post_tls) for more information.
 
    The return value of this query contains the information that is required to generate the trust token:
 
@@ -183,6 +182,28 @@ To authenticate a CLI or API client using a trust token, complete the following 
        '"addresses":["<server_address>"],'\
        '"secret":"<secret>","expires_at":"0001-01-01T00:00:00Z","type":"<type>"}' | base64 -w0
    <!-- include end tls identity API -->
+   ````
+   ````{group-tab} UI
+   ```{note}
+   If you do not already have access to the UI on the LXD server, see {ref}`access-ui`.
+
+   Follow these steps to create a pending fine-grained TLS identity.
+   To create a certificate add token, use the CLI or API.
+   ```
+
+   **Create a pending fine-grained TLS identity**
+
+   In the main navigation menu, click on {guilabel}`Permissions` and select {guilabel}`Identities`.
+   Then click on {guilabel}`+ Create TLS Identity` to open the identity creation side panel.
+
+   Enter a name for the identity, and check the boxes under {guilabel}`Auth groups` to add the identity to one or more predefined groups.
+   The identity will be authorized to perform actions based on the permissions assigned to those groups.
+
+   Click {guilabel}`Create identity` to create a pending fine-grained TLS identity and generate a new identity trust token.
+   Copy the token from the modal.
+   You can share this token with others to provide access to your LXD server with the pre-configured permissions.
+
+   Leave the modal open for instructions about how to authenticate the client.
    ````
    `````
 
@@ -237,6 +258,11 @@ To authenticate a CLI or API client using a trust token, complete the following 
 
    See [`POST /1.0/auth/identities/tls?public`](swagger:/auth/identities/identities_post_tls_untrusted) for more information.
    <!-- include end identity token -->
+   ````
+   ````{group-tab} UI
+   In the modal, click on {guilabel}`How to use it?` to expand the collapsed text.
+
+   Follow the expanded instructions to authenticate the LXD UI client with your LXD server using the identity trust token.
    ````
    `````
 

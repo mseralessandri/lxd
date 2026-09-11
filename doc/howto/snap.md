@@ -93,7 +93,7 @@ The {ref}`snap:how-to-guides-work-with-snaps-manage-updates` page in the Snap do
 (howto-snap-updates-manual)=
 ### Manual updates
 
-For an LXD snap installed as part of a cluster, see the section on {ref}`synchronizing cluster updates <howto-snap-updates-sync>` below.
+For a LXD snap installed as part of a cluster, see the section on {ref}`synchronizing cluster updates <howto-snap-updates-sync>` below.
 
 Otherwise, run:
 
@@ -232,6 +232,29 @@ To see all configuration options that are explicitly set on the snap, run:
 ```bash
 sudo snap get lxd
 ```
+
+### Configure feature previews
+
+```{warning}
+**Do not** enable feature previews in a production environment.
+Feature previews enable unsupported and unfinished functionality, which might cause unwanted or unpredictable system behavior, performance degradation, or data loss/corruption and more.
+```
+
+Feature previews provide access to work-in-progress features. All previews are disabled by default.
+
+To enable one or more feature previews, set the `features` option to a comma-separated list:
+
+```bash
+sudo snap set lxd features=feature_name,another_feature
+```
+
+To disable all feature previews, run:
+
+```bash
+sudo snap unset lxd features
+```
+
+Restart the LXD daemon to apply feature preview changes to the server, as described in {ref}`howto-snap-daemon`.
 
 For more information about snap configuration options, visit {ref}`snap:how-to-guides-work-with-snaps-configure-snaps` in the Snap documentation.
 

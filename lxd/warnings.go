@@ -201,16 +201,16 @@ func warningsGet(d *Daemon, r *http.Request) response.Response {
 		return response.SmartError(err)
 	}
 
-	var filters []api.Warning
+	var filteredWarnings []api.Warning
+	filteredWarnings, err = filterWarnings(warnings, clauses)
+	if err != nil {
+		return response.SmartError(err)
+	}
+
 	if recursive == 0 {
 		var resultList []string
 
-		filters, err = filterWarnings(warnings, clauses)
-		if err != nil {
-			return response.SmartError(err)
-		}
-
-		for _, w := range filters {
+		for _, w := range filteredWarnings {
 			url := api.NewURL().Path(version.APIVersion, "warnings", w.UUID).String()
 			resultList = append(resultList, url)
 		}
@@ -218,13 +218,8 @@ func warningsGet(d *Daemon, r *http.Request) response.Response {
 		return response.SyncResponse(true, resultList)
 	}
 
-	filters, err = filterWarnings(warnings, clauses)
-	if err != nil {
-		return response.SmartError(err)
-	}
-
-	// Return detailed list of warning
-	return response.SyncResponse(true, filters)
+	// Return detailed list of warnings
+	return response.SyncResponse(true, filteredWarnings)
 }
 
 // swagger:operation GET /1.0/warnings/{uuid} warnings warning_get
@@ -361,11 +356,11 @@ func warningPut(d *Daemon, r *http.Request) response.Response {
 	status, ok := warningtype.StatusTypes[req.Status]
 	if !ok {
 		// Invalid status
-		return response.BadRequest(fmt.Errorf("Invalid warning type %q", req.Status))
+		return response.BadRequest(fmt.Errorf("Invalid warning status %q", req.Status))
 	}
 
 	if status != warningtype.StatusAcknowledged && status != warningtype.StatusNew {
-		return response.Forbidden(errors.New(`Status may only be set to "acknowledge" or "new"`))
+		return response.Forbidden(errors.New(`Status may only be set to "acknowledged" or "new"`))
 	}
 
 	var warning *cluster.Warning
@@ -447,7 +442,7 @@ func pruneResolvedWarningsTask(stateFunc func() *state.State) (task.Func, task.S
 
 		args := operations.OperationArgs{
 			Type:    operationtype.WarningsPruneResolved,
-			Class:   operations.OperationClassTask,
+			Class:   operationtype.OperationClassTask,
 			RunHook: opRun,
 		}
 

@@ -5,7 +5,7 @@ Module: `github.com/canonical/lxd`.
 
 ## Prerequisites
 
-LXD requires Go 1.26.4 or higher and is only tested with the Golang compiler.
+LXD requires Go 1.26.7 or higher and is only tested with the Golang compiler.
 - CGO native dependencies (dqlite, liblxc). Fetch them once with:
 
   ```bash
@@ -27,7 +27,11 @@ client/         Go client library
 shared/         Code shared across components
 test/
   suites/       Integration test suites (bash)
+  snap/         Snap integration test scripts
+  snap.sh       Snap integration test runner
   lint/         Lint scripts
+  includes/
+    snap-helpers.sh  Shared snap integration test helpers
 doc/            Sphinx documentation
 ```
 
@@ -96,6 +100,9 @@ MicroOVN. See `test/README.md` for full setup instructions.
 ```bash
 # Run a specific suite
 sudo ./test/main.sh <suite-name>
+
+# Run a snap integration suite
+sudo -E ./test/snap.sh test/snap/cgroup latest/edge
 ```
 
 ## Key conventions

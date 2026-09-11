@@ -32,16 +32,18 @@ import (
 )
 
 var storagePoolVolumeSnapshotsTypeCmd = APIEndpoint{
-	Path:        "storage-pools/{poolName}/volumes/{type}/{volumeName}/snapshots",
-	MetricsType: entity.TypeStoragePool,
+	Path:            "storage-pools/{poolName}/volumes/{type}/{volumeName}/snapshots",
+	MetricsType:     entity.TypeStoragePool,
+	ProjectSpecific: true,
 
-	Get:  APIEndpointAction{Handler: storagePoolVolumeSnapshotsTypeGet, AccessHandler: allowProjectResourceList(false)},
+	Get:  APIEndpointAction{Handler: storagePoolVolumeSnapshotsTypeGet, AccessHandler: storagePoolVolumeTypeAccessHandler(auth.EntitlementCanView)},
 	Post: APIEndpointAction{Handler: storagePoolVolumeSnapshotsTypePost, AccessHandler: storagePoolVolumeTypeAccessHandler(auth.EntitlementCanManageSnapshots)},
 }
 
 var storagePoolVolumeSnapshotTypeCmd = APIEndpoint{
-	Path:        "storage-pools/{poolName}/volumes/{type}/{volumeName}/snapshots/{snapshotName}",
-	MetricsType: entity.TypeStoragePool,
+	Path:            "storage-pools/{poolName}/volumes/{type}/{volumeName}/snapshots/{snapshotName}",
+	MetricsType:     entity.TypeStoragePool,
+	ProjectSpecific: true,
 
 	Delete: APIEndpointAction{Handler: storagePoolVolumeSnapshotTypeDelete, AccessHandler: storagePoolVolumeTypeAccessHandler(auth.EntitlementCanDelete)},
 	Get:    APIEndpointAction{Handler: storagePoolVolumeSnapshotTypeGet, AccessHandler: storagePoolVolumeTypeAccessHandler(auth.EntitlementCanView)},
@@ -233,7 +235,7 @@ func storagePoolVolumeSnapshotsTypePost(d *Daemon, r *http.Request) response.Res
 		ProjectName: requestProjectName,
 		EntityURL:   volumeURL,
 		Type:        operationtype.VolumeSnapshotCreate,
-		Class:       operations.OperationClassTask,
+		Class:       operationtype.OperationClassTask,
 		RunHook:     snapshot,
 		Metadata: map[string]any{
 			api.MetadataEntityURL: api.NewURL().Path(version.APIVersion, "storage-pools", details.pool.Name(), "volumes", details.volumeTypeName, details.volumeName, "snapshots", req.Name).Project(requestProjectName).String(),
@@ -245,7 +247,7 @@ func storagePoolVolumeSnapshotsTypePost(d *Daemon, r *http.Request) response.Res
 		return response.InternalError(err)
 	}
 
-	return operations.OperationResponse(op)
+	return response.OperationResponse(op)
 }
 
 // swagger:operation GET /1.0/storage-pools/{poolName}/volumes/{type}/{volumeName}/snapshots storage storage_pool_volumes_type_snapshots_get
@@ -410,7 +412,7 @@ func storagePoolVolumeSnapshotsTypeGet(d *Daemon, r *http.Request) response.Resp
 	for _, volume := range volumes {
 		_, snapshotName, _ := api.GetParentAndSnapshotName(volume.Name)
 
-		if !canView(entity.StorageVolumeSnapshotURL(request.ProjectParam(r), details.location, details.pool.Name(), details.volumeTypeName, details.volumeName, snapshotName)) {
+		if !canView(entity.StorageVolumeSnapshotURL(effectiveProjectName, details.location, details.pool.Name(), details.volumeTypeName, details.volumeName, snapshotName)) {
 			continue
 		}
 
@@ -552,7 +554,7 @@ func storagePoolVolumeSnapshotTypePost(d *Daemon, r *http.Request) response.Resp
 		ProjectName: requestProjectName,
 		EntityURL:   originalEntityURLWithoutProject.Project(effectiveProjectName),
 		Type:        operationtype.VolumeSnapshotRename,
-		Class:       operations.OperationClassTask,
+		Class:       operationtype.OperationClassTask,
 		RunHook:     snapshotRename,
 		Metadata: map[string]any{
 			api.MetadataOriginalEntityURL: originalEntityURLWithoutProject.Project(requestProjectName).String(),
@@ -565,7 +567,7 @@ func storagePoolVolumeSnapshotTypePost(d *Daemon, r *http.Request) response.Resp
 		return response.InternalError(err)
 	}
 
-	return operations.OperationResponse(op)
+	return response.OperationResponse(op)
 }
 
 // swagger:operation GET /1.0/storage-pools/{poolName}/volumes/{type}/{volumeName}/snapshots/{snapshotName} storage storage_pool_volumes_type_snapshot_get
@@ -778,7 +780,7 @@ func storagePoolVolumeSnapshotTypePut(d *Daemon, r *http.Request) response.Respo
 		ProjectName: requestProjectName,
 		EntityURL:   snapshotURL,
 		Type:        operationtype.VolumeSnapshotUpdate,
-		Class:       operations.OperationClassTask,
+		Class:       operationtype.OperationClassTask,
 		RunHook:     run,
 	}
 
@@ -787,7 +789,7 @@ func storagePoolVolumeSnapshotTypePut(d *Daemon, r *http.Request) response.Respo
 		return response.InternalError(err)
 	}
 
-	return operations.OperationResponse(op)
+	return response.OperationResponse(op)
 }
 
 // swagger:operation PATCH /1.0/storage-pools/{poolName}/volumes/{type}/{volumeName}/snapshots/{snapshotName} storage storage_pool_volumes_type_snapshot_patch
@@ -901,7 +903,7 @@ func storagePoolVolumeSnapshotTypePatch(d *Daemon, r *http.Request) response.Res
 		ProjectName: requestProjectName,
 		EntityURL:   snapshotURL,
 		Type:        operationtype.VolumeSnapshotUpdate,
-		Class:       operations.OperationClassTask,
+		Class:       operationtype.OperationClassTask,
 		RunHook:     run,
 	}
 
@@ -910,7 +912,7 @@ func storagePoolVolumeSnapshotTypePatch(d *Daemon, r *http.Request) response.Res
 		return response.InternalError(err)
 	}
 
-	return operations.OperationResponse(op)
+	return response.OperationResponse(op)
 }
 
 func doStoragePoolVolumeSnapshotUpdate(ctx context.Context, s *state.State, pool storagePools.Pool, projectName string, volName string, volumeType dbCluster.StoragePoolVolumeType, req api.StorageVolumeSnapshotPut, op *operations.Operation) error {
@@ -1011,7 +1013,7 @@ func storagePoolVolumeSnapshotTypeDelete(d *Daemon, r *http.Request) response.Re
 		ProjectName: requestProjectName,
 		EntityURL:   snapshotURL,
 		Type:        operationtype.VolumeSnapshotDelete,
-		Class:       operations.OperationClassTask,
+		Class:       operationtype.OperationClassTask,
 		RunHook:     snapshotDelete,
 	}
 
@@ -1020,7 +1022,7 @@ func storagePoolVolumeSnapshotTypeDelete(d *Daemon, r *http.Request) response.Re
 		return response.InternalError(err)
 	}
 
-	return operations.OperationResponse(op)
+	return response.OperationResponse(op)
 }
 
 func pruneExpiredAndAutoCreateCustomVolumeSnapshotsTask(stateFunc func() *state.State) (task.Func, task.Schedule) {
@@ -1194,7 +1196,7 @@ func pruneExpiredAndAutoCreateCustomVolumeSnapshotsTask(stateFunc func() *state.
 
 			args := operations.OperationArgs{
 				Type:    operationtype.CustomVolumeSnapshotsExpire,
-				Class:   operations.OperationClassTask,
+				Class:   operationtype.OperationClassTask,
 				RunHook: opRun,
 			}
 
@@ -1220,7 +1222,7 @@ func pruneExpiredAndAutoCreateCustomVolumeSnapshotsTask(stateFunc func() *state.
 
 			args := operations.OperationArgs{
 				Type:    operationtype.VolumeSnapshotsCreateScheduled,
-				Class:   operations.OperationClassTask,
+				Class:   operationtype.OperationClassTask,
 				RunHook: opRun,
 			}
 

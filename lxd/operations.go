@@ -17,7 +17,6 @@ import (
 	"github.com/canonical/lxd/lxd/db"
 	dbCluster "github.com/canonical/lxd/lxd/db/cluster"
 	"github.com/canonical/lxd/lxd/db/operationtype"
-	"github.com/canonical/lxd/lxd/db/query"
 	"github.com/canonical/lxd/lxd/lifecycle"
 	"github.com/canonical/lxd/lxd/operations"
 	"github.com/canonical/lxd/lxd/request"
@@ -41,10 +40,11 @@ var operationCmd = APIEndpoint{
 }
 
 var operationsCmd = APIEndpoint{
-	Path:        "operations",
-	MetricsType: entity.TypeOperation,
+	Path:            "operations",
+	MetricsType:     entity.TypeOperation,
+	ProjectSpecific: true,
 
-	Get: APIEndpointAction{Handler: operationsGet, AccessHandler: allowProjectResourceList(true)},
+	Get: APIEndpointAction{Handler: operationsGet, AccessHandler: allowAuthenticated, AllProjectsMode: allProjectsModeAllowAll},
 }
 
 var operationWait = APIEndpoint{
@@ -100,7 +100,7 @@ func runningInstanceOperations() map[string]map[string][]*operations.Operation {
 	// A single instance may be referenced by multiple operations (e.g. multiple exec websockets).
 	ops := operations.Clone()
 	for _, op := range ops {
-		if !op.IsRunning() || op.Class() == operations.OperationClassToken {
+		if !op.IsRunning() || op.Class() == operationtype.OperationClassToken {
 			continue
 		}
 
@@ -166,6 +166,7 @@ func operationGet(d *Daemon, r *http.Request) response.Response {
 
 	// Load the operation from the database.
 	var op *operations.Operation
+	var childCount int64
 	err = s.DB.Cluster.Transaction(r.Context(), func(ctx context.Context, tx *db.ClusterTx) error {
 		dbOp, err := dbCluster.GetOperation(ctx, tx.Tx(), id)
 		if err != nil {
@@ -178,33 +179,35 @@ func operationGet(d *Daemon, r *http.Request) response.Response {
 			return api.StatusErrorf(http.StatusBadRequest, "Child operations cannot be retrieved individually")
 		}
 
-		op, err = operations.ConstructOperationFromDB(ctx, tx.Tx(), s, dbOp)
-		if err != nil {
-			return err
-		}
-
-		// Load children if needed
+		dbOps := []dbCluster.Operation{*dbOp}
 		if recursion > 0 {
-			// Load all child operations.
+			// Load all child operations for embedding in the response.
 			childDbOps, err := dbCluster.GetOperationsWithParent(ctx, tx.Tx(), dbOp.Row.ID)
 			if err != nil {
 				return err
 			}
 
-			children := make([]*operations.Operation, 0, len(childDbOps))
-			for _, childDbOp := range childDbOps {
-				childOp, err := operations.ConstructOperationFromDB(ctx, tx.Tx(), s, &childDbOp)
-				if err != nil {
-					return err
-				}
-
-				children = append(children, childOp)
+			dbOps = append(dbOps, childDbOps...)
+		} else {
+			// Count children from DB without loading full child operations.
+			childCount, err = dbCluster.CountOperationChildren(ctx, tx.Tx(), dbOp.Row.ID)
+			if err != nil {
+				return err
 			}
-
-			op.AddChildren(children...)
 		}
 
-		return err
+		constructedOps, err := operations.ConstructOperationsFromDB(ctx, tx.Tx(), s, dbOps)
+		if err != nil {
+			return err
+		}
+
+		if len(constructedOps) != 1 {
+			return fmt.Errorf("Expected to construct one operation but got %d", len(constructedOps))
+		}
+
+		op = constructedOps[0]
+
+		return nil
 	})
 	if err != nil {
 		return response.SmartError(err)
@@ -215,9 +218,15 @@ func operationGet(d *Daemon, r *http.Request) response.Response {
 		return response.SmartError(err)
 	}
 
-	_, body := op.RenderFullWithoutProgress()
+	_, apiOperation := op.RenderFullWithoutProgress()
 
-	return response.SyncResponse(true, body)
+	// If recursion > 0 the child count will be set when rendering the operation.
+	// Otherwise we need to set it because we didn't load the children.
+	if recursion == 0 {
+		apiOperation.ChildCount = childCount
+	}
+
+	return response.SyncResponse(true, apiOperation)
 }
 
 // swagger:operation DELETE /1.0/operations/{id} operations operation_delete
@@ -269,7 +278,11 @@ func operationDelete(d *Daemon, r *http.Request) response.Response {
 			return response.BadRequest(errors.New("Only running operations can be cancelled"))
 		}
 
-		op.Cancel()
+		err = op.Cancel()
+		if err != nil {
+			return response.SmartError(err)
+		}
+
 		s.Events.SendLifecycle(projectName, lifecycle.OperationCancelled.Event(op, request.CreateRequestor(r.Context()), nil))
 
 		_ = op.Wait(r.Context())
@@ -316,7 +329,7 @@ func operationCancelToken(ctx context.Context, s *state.State, projectName strin
 	// Check if operation is local and if so, cancel it.
 	localOp, _ := operations.OperationGetInternal(op.ID)
 	if localOp != nil {
-		localOp.Cancel()
+		_ = localOp.Cancel()
 		s.Events.SendLifecycle(projectName, lifecycle.OperationCancelled.Event(localOp, request.CreateRequestor(ctx), nil))
 		_ = localOp.Wait(ctx)
 
@@ -472,6 +485,11 @@ func operationsGet(d *Daemon, r *http.Request) response.Response {
 		return response.SmartError(err)
 	}
 
+	var projectFilter *string
+	if !allProjects {
+		projectFilter = &projectName
+	}
+
 	canViewProjectOperations, err := s.Authorizer.GetPermissionChecker(r.Context(), auth.EntitlementCanViewOperations, entity.TypeProject)
 	if err != nil {
 		return response.InternalError(fmt.Errorf("Failed getting operation permission checker: %w", err))
@@ -489,101 +507,60 @@ func operationsGet(d *Daemon, r *http.Request) response.Response {
 	recursion, _ := util.IsRecursionRequest(r)
 
 	// Map of parent operations keyed by the operation ID.
-	parentOps := make(map[int64]*operations.Operation)
+	var ops []*operations.Operation
+
+	// Child counts by parent UUID, populated via aggregate DB query for recursion < 2.
+	childCounts := make(map[string]int64)
+
 	err = s.DB.Cluster.Transaction(r.Context(), func(ctx context.Context, tx *db.ClusterTx) error {
-		projects, err := dbCluster.GetProjectIDsToNames(ctx, tx.Tx())
-		if err != nil {
-			return fmt.Errorf("Failed loading project IDs to names: %w", err)
-		}
-
-		// Make sure the requested project exists if not all-projects.
-		if !allProjects {
-			found := false
-			for _, name := range projects {
-				if name == projectName {
-					found = true
-					break
-				}
-			}
-
-			if !found {
-				return fmt.Errorf("Project %q does not exist", projectName)
+		// Check the project exists
+		if projectFilter != nil {
+			_, err := dbCluster.GetProject(ctx, tx.Tx(), *projectFilter)
+			if err != nil {
+				return err
 			}
 		}
 
-		// Load the operations.
+		// For non-recursive responses, only load parent operations from the DB.
+		// For recursive responses, load all operations so children can be embedded.
 		var dbOps []dbCluster.Operation
 		if recursion < 2 {
-			dbOps, err = dbCluster.GetParentOperations(ctx, tx.Tx())
-		} else {
-			dbOps, err = query.Select[dbCluster.Operation](ctx, tx.Tx(), "")
-		}
-
-		if err != nil {
-			return fmt.Errorf("Failed getting operations: %w", err)
-		}
-
-		// Map of child operations keyed by their parent operation ID.
-		childOps := make(map[int64][]*operations.Operation)
-		for _, dbOp := range dbOps {
-			// Omit child operations if not requested.
-			if dbOp.Row.Parent != nil && recursion < 2 {
-				continue
-			}
-
-			// Get operation project name if it has one.
-			operationProject := ""
-			if dbOp.Row.ProjectID != nil {
-				var ok bool
-				operationProject, ok = projects[*dbOp.Row.ProjectID]
-				if !ok {
-					return fmt.Errorf("Failed finding project name for operation with non-existent project ID %d", *dbOp.Row.ProjectID)
-				}
-			}
-
-			if !allProjects && operationProject != "" && operationProject != projectName {
-				continue
-			}
-
-			// Omit operations that don't have a project if the caller does not have access to server operations.
-			if operationProject == "" && !canViewServerOperations {
-				continue
-			}
-
-			// Construct the operation object, which will also reconstruct its requestor.
-			op, err := operations.ConstructOperationFromDB(ctx, tx.Tx(), s, &dbOp)
+			dbOps, err = dbCluster.GetOperations(ctx, tx.Tx(), false, projectFilter)
 			if err != nil {
-				return fmt.Errorf("Failed loading operation ID %q: %w", dbOp.Row.UUID, err)
+				return fmt.Errorf("Failed getting operations: %w", err)
+			}
+
+			// For non-recursive responses, retrieve child counts via an aggregate query rather than
+			// loading and constructing every child operation just to compute counts.
+			childCounts, err = dbCluster.CountOperationChildrenByParent(ctx, tx.Tx())
+			if err != nil {
+				return fmt.Errorf("Failed getting child operation counts: %w", err)
+			}
+		} else {
+			dbOps, err = dbCluster.GetOperations(ctx, tx.Tx(), true, projectFilter)
+			if err != nil {
+				return fmt.Errorf("Failed getting operations: %w", err)
+			}
+		}
+
+		filteredOps := make([]dbCluster.Operation, 0, len(dbOps))
+		for _, dbOp := range dbOps {
+			// Omit operations that don't have a project if the caller does not have access to server operations.
+			if dbOp.Row.ProjectID == nil && !canViewServerOperations {
+				continue
 			}
 
 			// Omit operations if the caller does not have `can_view_operations` on the operations' project and the caller is not the operation owner.
-			if !canViewProjectOperations(entity.ProjectURL(operationProject)) && !requestor.CallerIsEqual(op.Requestor()) {
+			if !canViewProjectOperations(entity.ProjectURL(dbOp.ProjectName)) && !requestor.CallerIsEqual(dbOp.Requestor()) {
 				continue
 			}
 
-			// If this is a child operations, add it to the list keyed by parent DB ID.
-			// We'll match these to actual parents later.
-			if dbOp.Row.Parent != nil {
-				_, ok := childOps[*dbOp.Row.Parent]
-				if !ok {
-					childOps[*dbOp.Row.Parent] = make([]*operations.Operation, 0)
-				}
-
-				childOps[*dbOp.Row.Parent] = append(childOps[*dbOp.Row.Parent], op)
-			} else {
-				parentOps[dbOp.Row.ID] = op
-			}
+			filteredOps = append(filteredOps, dbOp)
 		}
 
-		// Now add the child operations to their parents.
-		for parentID, children := range childOps {
-			parentOp, ok := parentOps[parentID]
-			if !ok {
-				logger.Warn("Failed finding parent operation for child operations, skipping children", logger.Ctx{"parentID": parentID})
-				continue
-			}
-
-			parentOp.AddChildren(children...)
+		ops, err = operations.ConstructOperationsFromDB(ctx, tx.Tx(), s, filteredOps)
+		if err != nil {
+			return fmt.Errorf("Failed constructing operation list: %w", err)
 		}
 
 		return nil
@@ -593,9 +570,18 @@ func operationsGet(d *Daemon, r *http.Request) response.Response {
 	}
 
 	// Render the operations.
-	apiOps := make([]*api.OperationFull, 0, len(parentOps))
-	for _, op := range parentOps {
-		_, apiOp := op.RenderFullWithoutProgress()
+	apiOps := make([]*api.OperationFull, 0, len(ops))
+	for _, op := range ops {
+		var apiOp *api.OperationFull
+		if recursion >= 2 {
+			_, apiOp = op.RenderFullWithoutProgress()
+		} else {
+			// If not recursive, set the child count.
+			_, retOp := op.RenderWithoutProgress()
+			retOp.ChildCount = childCounts[op.ID()]
+			apiOp = &api.OperationFull{Operation: *retOp}
+		}
+
 		apiOps = append(apiOps, apiOp)
 	}
 
@@ -664,9 +650,15 @@ func operationsGetByType(ctx context.Context, s *state.State, projectName string
 		}
 	}
 
+	now := time.Now()
 	apiOps := make([]*api.Operation, 0, len(ops))
 	for _, op := range ops {
 		if s.ServerClustered && excludeOffline && !online[op.NodeAddress] {
+			continue
+		}
+
+		// Skip operations that are finished and are pending deletion.
+		if api.StatusCode(op.Row.StatusCode).IsFinal() && now.Sub(op.Row.UpdatedAt) > operations.OperationRetentionDuration {
 			continue
 		}
 
@@ -686,7 +678,7 @@ func operationsGetByType(ctx context.Context, s *state.State, projectName string
 
 		apiOps = append(apiOps, &api.Operation{
 			ID:          op.Row.UUID,
-			Class:       operations.OperationClass(op.Row.Class).String(),
+			Class:       operationtype.Class(op.Row.Class).String(),
 			Description: op.Row.Type.Description(),
 			CreatedAt:   op.Row.CreatedAt,
 			UpdatedAt:   op.Row.UpdatedAt,
@@ -986,7 +978,7 @@ func operationWebsocketGet(d *Daemon, r *http.Request) response.Response {
 	// First check if the query is for a local operation from this node
 	op, err := operations.OperationGetInternal(id)
 	if err == nil {
-		return operations.OperationWebSocket(op)
+		return response.OperationWebSocket(op)
 	}
 
 	// Then check if the query is from an operation on another node, and, if so, forward it
@@ -1019,7 +1011,7 @@ func operationWebsocketGet(d *Daemon, r *http.Request) response.Response {
 		return response.SmartError(err)
 	}
 
-	return operations.ForwardedOperationWebSocket(id, source)
+	return response.ForwardedOperationWebSocket(id, source)
 }
 
 func autoRemoveOrphanedOperationsTask(stateFunc func() *state.State) (task.Func, task.Schedule) {
@@ -1047,7 +1039,7 @@ func autoRemoveOrphanedOperationsTask(stateFunc func() *state.State) (task.Func,
 
 		args := operations.OperationArgs{
 			Type:    operationtype.RemoveOrphanedOperations,
-			Class:   operations.OperationClassTask,
+			Class:   operationtype.OperationClassTask,
 			RunHook: opRun,
 		}
 
@@ -1112,68 +1104,126 @@ func autoRemoveOrphanedOperations(ctx context.Context, s *state.State) error {
 	return nil
 }
 
-// PruneExpiredOperationsTask returns a task function and schedule that is used to prune expired operations from the database.
-func pruneExpiredOperationsTask(stateFunc func() *state.State) (task.Func, task.Schedule) {
+// synchronizeOperationsTask returns a task function and schedule that is used to synchronize and prune expired operations from the database.
+func synchronizeOperationsTask(stateFunc func() *state.State) (task.Func, task.Schedule) {
 	f := func(ctx context.Context) {
 		s := stateFunc()
-
-		leaderInfo, err := s.LeaderInfo()
-		if err != nil {
-			logger.Error("Failed getting leader cluster member address", logger.Ctx{"err": err})
-			return
-		}
-
-		if !leaderInfo.Leader {
-			logger.Debug("Skipping pruning expired operations since we're not leader")
-			return
-		}
-
 		opRun := func(ctx context.Context, op *operations.Operation) error {
-			return operations.PruneExpiredOperations(ctx, s)
+			return operations.Synchronize(ctx, s)
 		}
 
 		args := operations.OperationArgs{
-			Type:    operationtype.PruneExpiredOperations,
-			Class:   operations.OperationClassTask,
+			Type:    operationtype.SynchronizeOperations,
+			Class:   operationtype.OperationClassTask,
 			RunHook: opRun,
 		}
 
 		op, err := operations.ScheduleServerOperation(s, args)
 		if err != nil {
-			logger.Error("Failed creating prune expired operations operation", logger.Ctx{"err": err})
+			logger.Error("Failed creating operation synchronization operation", logger.Ctx{"err": err})
 			return
 		}
 
 		err = op.Wait(ctx)
 		if err != nil {
-			logger.Error("Failed pruning expired operations", logger.Ctx{"err": err})
+			logger.Error("Failed synchronizing operations", logger.Ctx{"err": err})
 			return
 		}
 	}
 
-	return f, task.Hourly()
+	return f, task.Every(time.Minute)
 }
 
 // operationWaitPost represents the fields of a request to register a dummy operation.
 type operationWaitPost struct {
-	Duration          string                    `json:"duration" yaml:"duration"`
-	OpClass           operations.OperationClass `json:"op_class" yaml:"op_class"`
-	OpType            operationtype.Type        `json:"op_type" yaml:"op_type"`
-	EntityURL         string                    `json:"entity_url" yaml:"entity_url"`
-	ConflictReference string                    `json:"conflict_reference" yaml:"conflict_reference"`
+	Duration          string              `json:"duration" yaml:"duration"`
+	OpClass           operationtype.Class `json:"op_class" yaml:"op_class"`
+	OpType            operationtype.Type  `json:"op_type" yaml:"op_type"`
+	EntityURL         string              `json:"entity_url" yaml:"entity_url"`
+	ConflictReference string              `json:"conflict_reference" yaml:"conflict_reference"`
 }
 
-// operationWaitHandler creates a dummy operation that waits for a specified duration.
-func operationWaitHandler(d *Daemon, r *http.Request) response.Response {
+func init() {
+	operations.RegisterDurableOperationRunHook(operationtype.Wait, internalTestingWaitHandlerOperationRunHook)
+}
+
+const operationInputKeyWaitHandlerDuration operations.InputKey = "duration"
+
+// internalTestingWaitHandlerOperationRunHook is a durable operation run hook used for testing. It accepts a "duration"
+// input value and logs a warning every second until the duration is complete. The elapsed duration is saved to the
+// operation metadata on each tick, so that if the member running this operation goes offline, the operation is restarted
+// on the leader and continues from the current elapsed duration.
+func internalTestingWaitHandlerOperationRunHook(ctx context.Context, op *operations.Operation) error {
+	inputDuration, err := operations.GetOperationInputValue[string](op, operationInputKeyWaitHandlerDuration)
+	if err != nil {
+		return err
+	}
+
+	duration, err := time.ParseDuration(inputDuration)
+	if err != nil {
+		return fmt.Errorf("Invalid duration: %w", err)
+	}
+
+	s := op.State()
+
+	l := logger.AddContext(logger.Ctx{"total_duration": inputDuration, "member_name": s.ServerName})
+
+	// Initialize metadata map if needed.
+	metadata := op.Metadata()
+	if metadata == nil {
+		metadata = make(map[string]any)
+		err = op.UpdateMetadata(metadata)
+		if err != nil {
+			return fmt.Errorf("Failed initializing operation metadata: %w", err)
+		}
+	}
+
+	// See if some waiting was already done.
+	elapsed := time.Duration(0)
+	elapsedMetadata, ok := metadata["elapsed"]
+	if ok {
+		elapsed, err = time.ParseDuration(elapsedMetadata.(string))
+		if err != nil {
+			return fmt.Errorf("Failed parsing elapsed metadata: %w", err)
+		}
+
+		l.Warn("Resuming wait handler operation", logger.Ctx{"elapsed": elapsed.String()})
+	} else {
+		l.Warn("Starting wait handler operation")
+	}
+
+	for duration > elapsed {
+		// Sleep for one second, or until the run context is cancelled.
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(time.Second):
+		}
+
+		elapsed = elapsed + time.Second
+		l.Warn("Running wait handler operation", logger.Ctx{"elapsed": elapsed.String()})
+		metadata["elapsed"] = elapsed.String()
+		err = op.UpdateMetadata(metadata)
+		if err != nil {
+			return fmt.Errorf("Failed updating operation metadata: %w", err)
+		}
+
+		err = op.Persist()
+		if err != nil {
+			return fmt.Errorf("Failed persisting operation: %w", err)
+		}
+	}
+
+	l.Warn("Wait handler operation completed")
+
+	return nil
+}
+
+// internalTestingOperationWaitHandler creates a dummy operation that waits for a specified duration.
+func internalTestingOperationWaitHandler(d *Daemon, r *http.Request) response.Response {
 	// Extract the entity URL and duration from the request.
 	req := operationWaitPost{}
 	err := json.NewDecoder(r.Body).Decode(&req)
-	if err != nil {
-		return response.BadRequest(err)
-	}
-
-	// Parse the duration.
-	duration, err := time.ParseDuration(req.Duration)
 	if err != nil {
 		return response.BadRequest(err)
 	}
@@ -1183,46 +1233,50 @@ func operationWaitHandler(d *Daemon, r *http.Request) response.Response {
 		return response.BadRequest(fmt.Errorf("Invalid operation type code %d", req.OpType))
 	}
 
-	run := func(ctx context.Context, op *operations.Operation) error {
-		// Sleep for the duration, or until the run context is cancelled.
-		timer := time.NewTimer(duration)
-		defer timer.Stop()
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-timer.C:
+	var entityURL *api.URL
+	if req.EntityURL != "" {
+		u, err := url.Parse(req.EntityURL)
+		if err != nil {
+			return response.BadRequest(fmt.Errorf("Failed parsing operation entity URL: %w", err))
 		}
 
-		return nil
-	}
-
-	u, err := url.Parse(req.EntityURL)
-	if err != nil {
-		return response.BadRequest(fmt.Errorf("Failed parsing operation entity URL: %w", err))
+		entityURL = &api.URL{URL: *u}
 	}
 
 	var onConnect func(op *operations.Operation, r *http.Request, w http.ResponseWriter) error
-	if req.OpClass == operations.OperationClassWebsocket {
+	if req.OpClass == operationtype.OperationClassWebsocket {
 		onConnect = func(op *operations.Operation, r *http.Request, w http.ResponseWriter) error {
 			// Do nothing
 			return nil
 		}
 	}
 
-	args := operations.OperationArgs{
+	args := &operations.OperationArgs{
 		ProjectName:       request.QueryParam(r, "project"),
 		Type:              req.OpType,
 		Class:             req.OpClass,
-		RunHook:           run,
+		RunHook:           internalTestingWaitHandlerOperationRunHook,
 		ConnectHook:       onConnect,
-		EntityURL:         &api.URL{URL: *u},
+		EntityURL:         entityURL,
 		ConflictReference: req.ConflictReference,
 	}
 
-	op, err := operations.ScheduleServerOperation(d.State(), args)
+	err = args.SetInputValues(map[operations.InputKey]any{
+		operationInputKeyWaitHandlerDuration: req.Duration,
+	})
+	if err != nil {
+		return response.SmartError(err)
+	}
+
+	// Can't set the run hook for durable operations.
+	if args.Class == operationtype.OperationClassDurable {
+		args.RunHook = nil
+	}
+
+	op, err := operations.ScheduleServerOperation(d.State(), *args)
 	if err != nil {
 		return response.InternalError(err)
 	}
 
-	return operations.OperationResponse(op)
+	return response.OperationResponse(op)
 }

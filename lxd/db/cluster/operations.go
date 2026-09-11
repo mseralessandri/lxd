@@ -17,7 +17,6 @@ import (
 	"github.com/canonical/lxd/lxd/request"
 	"github.com/canonical/lxd/shared/api"
 	"github.com/canonical/lxd/shared/entity"
-	"github.com/canonical/lxd/shared/logger"
 )
 
 // OperationsRow is a row of the operations table.
@@ -89,12 +88,35 @@ type Operation struct {
 	IdentityIdentifier string `db:"coalesce(identities.identifier, '')"`
 }
 
-// OperationFilter specifies potential query parameter fields.
-type OperationFilter struct {
-	ID     *int64
-	NodeID *int64
-	UUID   *string
-	Parent *int64
+// Requestor returns the [request.RequestorAuditor] for the [Operation], if set.
+func (o Operation) Requestor() *request.RequestorAuditor {
+	// If no protocol is set, it was a server operation with no requestor.
+	if o.Row.RequestorProtocol == nil || *o.Row.RequestorProtocol == "" {
+		return nil
+	}
+
+	// Otherwise return a requestor auditor with the details.
+	// Note that the origin address is not saved.
+	return &request.RequestorAuditor{
+		IdentityID: o.Row.RequestorIdentityID,
+		Username:   o.IdentityIdentifier,
+		Protocol:   string(*o.Row.RequestorProtocol),
+	}
+}
+
+// IsFinished returns true if the operation status is final.
+func (o Operation) IsFinished() bool {
+	return api.StatusCode(o.Row.StatusCode).IsFinal()
+}
+
+// UpdatedAt returns the last update timestamp for the operation.
+func (o Operation) UpdatedAt() time.Time {
+	return o.Row.UpdatedAt
+}
+
+// IsChild returns true if the operation references a parent.
+func (o Operation) IsChild() bool {
+	return o.Row.Parent != nil
 }
 
 // RequestorProtocol is the database representation of the Requestor Protocol.
@@ -177,6 +199,61 @@ func (r *RequestorProtocol) Value() (driver.Value, error) {
 	return nil, fmt.Errorf("Invalid requestor protocol %q", *r)
 }
 
+// OperationsResourcesRow represents a row of the operations_resources table.
+// db:model operations_resources
+type OperationsResourcesRow struct {
+	// db:primary
+	OperationID int64 `db:"operation_id"`
+	// db:primary
+	EntityID int64 `db:"entity_id"`
+	// db:primary
+	EntityType EntityType `db:"entity_type"`
+}
+
+// APIName implements [query.APINamer] for [OperationsResourcesRow] for API friendly error messages.
+func (OperationsResourcesRow) APIName() string {
+	return "Operation resource"
+}
+
+// GetOperations returns slice of [Operation] based on given filters. If includeChildren is false, only operations that
+// do not reference parent operations are returned. If the project is non-nil, only operations in the given project are
+// returned if the project is not [api.ProjectDefaultName]. If the project is non-nil, and equal to [api.ProjectDefaultName]
+// then server-level operations are returned along with all operations in the default project. This is to match legacy behaviour.
+func GetOperations(ctx context.Context, tx *sql.Tx, includeChildren bool, project *string) ([]Operation, error) {
+	clauses := make([]string, 0, 2)
+	args := make([]any, 0, 1)
+	if !includeChildren {
+		clauses = append(clauses, "operations.parent IS NULL")
+	}
+
+	if project != nil {
+		// Unfortunately, since there is no way to request "no project" via the API (e.g. it always defaults to the default project)
+		// we need to include server-level operations when the requested project is default. Server level operations will always
+		// be included in requests for `all-projects`. They are filtered out in the API handler depending on what the caller is
+		// able to view.
+		projectClause := "projects.name = ?"
+		if *project == api.ProjectDefaultName {
+			projectClause = "(projects.name = ? OR operations.project_id IS NULL)"
+		}
+
+		clauses = append(clauses, projectClause)
+		args = append(args, *project)
+	}
+
+	clause := ""
+	if len(clauses) > 0 {
+		clause = "WHERE " + strings.Join(clauses, " AND ")
+	}
+
+	return query.Select[Operation](ctx, tx, clause, args...)
+}
+
+// GetOperationWithChildren gets a single operation and all of its children (if it has any).
+func GetOperationWithChildren(ctx context.Context, tx *sql.Tx, operationUUID string) ([]Operation, error) {
+	clause := "WHERE operations.uuid = ? OR operations.parent = (SELECT operations.id FROM operations WHERE operations.uuid = ?)"
+	return query.Select[Operation](ctx, tx, clause, operationUUID, operationUUID)
+}
+
 // UpdateOperation updates operation status, metadata and error (if set) in the cluster db.
 // This is used to keep DB in sync with the current status of the operation when the operation changes
 // its status, or when calls to commit metadata explicitly. The caller is expected to pass in the current node ID.
@@ -216,70 +293,6 @@ func UpdateOperation(ctx context.Context, tx *sql.Tx, opUUID string, nodeID int6
 	return nil
 }
 
-// GetOperationResources loads operation resources from the cluster db.
-// The entity type is used as the key of the map, as the actual key is not stored in the DB.
-func GetOperationResources(ctx context.Context, tx *sql.Tx, opID int64) (map[entity.Type][]api.URL, error) {
-	stmt := `SELECT entity_id, entity_type FROM operations_resources WHERE operation_id = ?`
-
-	// We cannot call GetEntityURL from within the scan function because it would start a new transaction.
-	// So first we read all the entity IDs and types into a slice, then we loop over that slice to get the URLs.
-	resources := []*struct {
-		EntityID   int
-		EntityType EntityType
-	}{}
-	err := query.Scan(ctx, tx, stmt, func(scan func(dest ...any) error) error {
-		r := struct {
-			EntityID   int
-			EntityType EntityType
-		}{}
-
-		err := scan(&r.EntityID, &r.EntityType)
-		if err != nil {
-			return err
-		}
-
-		resources = append(resources, &r)
-
-		return nil
-	}, opID)
-	if err != nil {
-		return nil, fmt.Errorf("Failed reading operation resources: %w", err)
-	}
-
-	var result map[entity.Type][]api.URL
-	for _, r := range resources {
-		entityURL, err := GetEntityURL(ctx, tx, entity.Type(r.EntityType), r.EntityID)
-		if err != nil {
-			// If a delete operation has already deleted its resources, it's possible that some of the resources will not be found.
-			// In that case, we just skip those resources and return the ones that are still there.
-			if api.StatusErrorCheck(err, http.StatusNotFound) {
-				logger.Debug("Failed loading resource URL for operation resource, skipping resource", logger.Ctx{"entity_type": r.EntityType, "entity_id": r.EntityID, "err": err})
-				continue
-			}
-
-			return nil, fmt.Errorf("Failed loading resource URL for operation resource: %w", err)
-		}
-
-		if result == nil {
-			result = map[entity.Type][]api.URL{}
-		}
-
-		_, ok := result[entity.Type(r.EntityType)]
-		if !ok {
-			result[entity.Type(r.EntityType)] = []api.URL{}
-		}
-
-		result[entity.Type(r.EntityType)] = append(result[entity.Type(r.EntityType)], *entityURL)
-	}
-
-	return result, nil
-}
-
-// GetParentOperations returns all parent operation, that is all operations that don't have a parent.
-func GetParentOperations(ctx context.Context, tx *sql.Tx) ([]Operation, error) {
-	return query.Select[Operation](ctx, tx, "WHERE operations.parent IS NULL")
-}
-
 // CreateOperationResources registers operation resources in the cluster db.
 func CreateOperationResources(ctx context.Context, tx *sql.Tx, opID int64, resources map[entity.Type][]api.URL) error {
 	// No resources to register.
@@ -287,8 +300,7 @@ func CreateOperationResources(ctx context.Context, tx *sql.Tx, opID int64, resou
 		return nil
 	}
 
-	sb := strings.Builder{}
-	sb.WriteString(`INSERT INTO operations_resources (operation_id, entity_id, entity_type) VALUES `)
+	var opResources []OperationsResourcesRow
 	for _, entityURLs := range resources {
 		for _, entityURL := range entityURLs {
 			entityReference, err := GetEntityReferenceFromURL(ctx, tx, &entityURL)
@@ -296,25 +308,15 @@ func CreateOperationResources(ctx context.Context, tx *sql.Tx, opID int64, resou
 				return fmt.Errorf("Failed getting entity ID from resource URL %q: %w", entityURL.String(), err)
 			}
 
-			entityTypeCode, err := entityReference.EntityType.Value()
-			if err != nil {
-				return fmt.Errorf("Failed getting entity type code for entity type %q: %w", entityReference.EntityType, err)
-			}
-
-			fmt.Fprintf(&sb, "(%d, %d, %d),", opID, entityReference.EntityID, entityTypeCode)
+			opResources = append(opResources, OperationsResourcesRow{
+				OperationID: opID,
+				EntityID:    int64(entityReference.EntityID),
+				EntityType:  entityReference.EntityType,
+			})
 		}
 	}
 
-	// Get the final stmt and replace the trailing comma with a semicolon.
-	insertStmt := sb.String()
-	insertStmt = insertStmt[:len(insertStmt)-1] + ";"
-
-	_, err := tx.ExecContext(ctx, insertStmt)
-	if err != nil {
-		return fmt.Errorf("Failed inserting operation resources: %w", err)
-	}
-
-	return nil
+	return query.CreateMany(ctx, tx, opResources)
 }
 
 // deleteEphemeralOperationsFromNodes deletes ephemeral operations from nodes with the given list of IDs.
@@ -376,11 +378,6 @@ func GetOperationsByProjectAndType(ctx context.Context, tx *sql.Tx, projectName 
 	return query.Select[Operation](ctx, tx, "WHERE coalesce(projects.name, '') = ? AND operations.type = ?", projectName, opType)
 }
 
-// DeleteOperation deletes an operation by UUID.
-func DeleteOperation(ctx context.Context, tx *sql.Tx, operationUUID string) error {
-	return query.DeleteOne[OperationsRow](ctx, tx, "WHERE operations.uuid = ?", operationUUID)
-}
-
 // GetOperation gets an [Operation] by UUID.
 func GetOperation(ctx context.Context, tx *sql.Tx, operationUUID string) (*Operation, error) {
 	return query.SelectOne[Operation](ctx, tx, "WHERE operations.uuid = ?", operationUUID)
@@ -394,4 +391,48 @@ func GetOperationsWithParent(ctx context.Context, tx *sql.Tx, parentID int64) ([
 // GetOperationsByNodeID gets all operations on the given node ID.
 func GetOperationsByNodeID(ctx context.Context, tx *sql.Tx, nodeID int64) ([]Operation, error) {
 	return query.Select[Operation](ctx, tx, "WHERE operations.node_id = ?", nodeID)
+}
+
+// CountOperationChildrenByParent returns a map of parent operation UUID to child count.
+// This is used to populate ChildCount on list responses without loading full child operations.
+func CountOperationChildrenByParent(ctx context.Context, tx *sql.Tx) (map[string]int64, error) {
+	stmt := `
+		SELECT parent_op.uuid, COUNT(*)
+		FROM operations child_op
+		JOIN operations parent_op ON child_op.parent = parent_op.id
+		WHERE child_op.parent IS NOT NULL
+		GROUP BY parent_op.id`
+
+	counts := make(map[string]int64)
+	err := query.Scan(ctx, tx, stmt, func(scan func(dest ...any) error) error {
+		var uuid string
+		var count int64
+		err := scan(&uuid, &count)
+		if err != nil {
+			return err
+		}
+
+		counts[uuid] = count
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("Failed counting child operations by parent: %w", err)
+	}
+
+	return counts, nil
+}
+
+// CountOperationChildren returns the number of child operations for the given parent operation DB ID.
+func CountOperationChildren(ctx context.Context, tx *sql.Tx, parentID int64) (int64, error) {
+	stmt := `SELECT COUNT(*) FROM operations WHERE parent = ?`
+
+	var count int64
+	err := query.Scan(ctx, tx, stmt, func(scan func(dest ...any) error) error {
+		return scan(&count)
+	}, parentID)
+	if err != nil {
+		return 0, fmt.Errorf("Failed counting child operations: %w", err)
+	}
+
+	return count, nil
 }

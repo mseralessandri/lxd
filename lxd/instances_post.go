@@ -149,7 +149,7 @@ func createFromImage(r *http.Request, s *state.State, p api.Project, profiles []
 		ProjectName: p.Name,
 		EntityURL:   api.NewURL().Path(version.APIVersion, "projects", p.Name),
 		Type:        operationtype.InstanceCreate,
-		Class:       operations.OperationClassTask,
+		Class:       operationtype.OperationClassTask,
 		RunHook:     run,
 		Metadata: map[string]any{
 			api.MetadataEntityURL: api.NewURL().Path(version.APIVersion, "instances", req.Name).Project(p.Name).String(),
@@ -161,7 +161,7 @@ func createFromImage(r *http.Request, s *state.State, p api.Project, profiles []
 		return response.InternalError(err)
 	}
 
-	return operations.OperationResponse(op)
+	return response.OperationResponse(op)
 }
 
 func createFromNone(r *http.Request, s *state.State, projectName string, profiles []api.Profile, req *api.InstancesPost) response.Response {
@@ -210,7 +210,7 @@ func createFromNone(r *http.Request, s *state.State, projectName string, profile
 		ProjectName: projectName,
 		EntityURL:   api.NewURL().Path(version.APIVersion, "projects", projectName),
 		Type:        operationtype.InstanceCreate,
-		Class:       operations.OperationClassTask,
+		Class:       operationtype.OperationClassTask,
 		RunHook:     run,
 		Metadata: map[string]any{
 			api.MetadataEntityURL: api.NewURL().Path(version.APIVersion, "instances", req.Name).Project(projectName).String(),
@@ -222,7 +222,7 @@ func createFromNone(r *http.Request, s *state.State, projectName string, profile
 		return response.InternalError(err)
 	}
 
-	return operations.OperationResponse(op)
+	return response.OperationResponse(op)
 }
 
 // instanceMigrationSinkResult holds the outputs of prepareInstanceMigrationSink needed by
@@ -441,11 +441,11 @@ func createFromMigration(r *http.Request, s *state.State, projectName string, pr
 	}
 
 	if result.push {
-		opArgs.Class = operations.OperationClassWebsocket
+		opArgs.Class = operationtype.OperationClassWebsocket
 		opArgs.Metadata = result.sink.Metadata()
 		opArgs.ConnectHook = result.sink.Connect
 	} else {
-		opArgs.Class = operations.OperationClassTask
+		opArgs.Class = operationtype.OperationClassTask
 	}
 
 	op, err := operations.ScheduleUserOperationFromRequest(s, r, opArgs)
@@ -454,7 +454,7 @@ func createFromMigration(r *http.Request, s *state.State, projectName string, pr
 	}
 
 	result.revert.Success()
-	return operations.OperationResponse(op)
+	return response.OperationResponse(op)
 }
 
 // createFromConversion receives the root disk (container FS or VM block volume) from the client and creates an
@@ -548,7 +548,7 @@ func createFromConversion(r *http.Request, s *state.State, projectName string, p
 		ProjectName: projectName,
 		EntityURL:   api.NewURL().Path(version.APIVersion, "projects", projectName),
 		Type:        operationtype.InstanceCreate,
-		Class:       operations.OperationClassWebsocket,
+		Class:       operationtype.OperationClassWebsocket,
 		Metadata:    metadata,
 		RunHook:     run,
 		ConnectHook: sink.Connect,
@@ -560,7 +560,7 @@ func createFromConversion(r *http.Request, s *state.State, projectName string, p
 	}
 
 	revert.Success()
-	return operations.OperationResponse(op)
+	return response.OperationResponse(op)
 }
 
 func createFromCopy(r *http.Request, s *state.State, projectName string, profiles []api.Profile, req *api.InstancesPost, targetMemberInfo *db.NodeInfo) response.Response {
@@ -582,6 +582,55 @@ func createFromCopy(r *http.Request, s *state.State, projectName string, profile
 	source, err := instance.LoadByProjectAndName(s, sourceProject, req.Source.Source)
 	if err != nil {
 		return response.SmartError(err)
+	}
+
+	// For cross-project copies, validate that the instance and its snapshots satisfy the target
+	// project's restrictions before starting the copy operation. This check must run before any
+	// cluster-redirect early returns so that cross-cluster copies are also covered.
+	if sourceProject != targetProject {
+		profileNames := make([]string, 0, len(profiles))
+		for _, p := range profiles {
+			profileNames = append(profileNames, p.Name)
+		}
+
+		// Resolve the effective target root disk device the same way instanceCreateAsCopy
+		// does: expand the request's devices with the target project's profiles. This
+		// yields the root disk device key that each snapshot's root disk will be aligned
+		// to (adjustSnapRootDiskPool), and the pool that the snapshots will actually be
+		// created on.
+		targetDevices := instancetype.ExpandInstanceDevices(deviceConfig.NewDevices(req.Devices), profiles)
+		rootDevKey, rootDev, err := api.GetRootDiskDevice(targetDevices.CloneNative())
+		if err != nil && !errors.Is(err, api.ErrNoRootDisk) {
+			// The only other error is ErrMultipleRootDisks, a client/config error.
+			return response.BadRequest(err)
+		}
+
+		targetPool := rootDev["pool"]
+
+		// If no pool is set on the resolved root disk (neither the request nor the
+		// profiles specify one), fall back to the same single-pool resolution the copy
+		// relies on.
+		if targetPool == "" {
+			targetPool, _, _, _, err = instanceFindStoragePool(s, targetProject, req)
+			if err != nil {
+				return response.SmartError(err)
+			}
+		}
+
+		// When neither the request nor the profiles define a root disk, the create path
+		// injects one with a generated name (see setupInstanceArgs). Mirror that name
+		// selection so snapshots are aligned to the same key rather than an empty device
+		// name.
+		if rootDevKey == "" {
+			rootDevKey = freeRootDiskDeviceName(deviceConfig.NewDevices(req.Devices))
+		}
+
+		// We keep the ContainerOnly for backward compatibility.
+		copyInstanceOnly := req.Source.InstanceOnly || req.Source.ContainerOnly //nolint:staticcheck,unused
+		err = checkTargetProjectRestrictions(r.Context(), s, source, targetProject, sourceProject, req.Name, req.Config, req.Devices, profileNames, copyInstanceOnly, req.Source.OverrideSnapshotProfiles, rootDevKey, targetPool)
+		if err != nil {
+			return response.SmartError(err)
+		}
 	}
 
 	// When clustered, use the node name, otherwise use the hostname.
@@ -762,7 +811,7 @@ func createFromCopy(r *http.Request, s *state.State, projectName string, profile
 		ProjectName: targetProject,
 		EntityURL:   entityURL,
 		Type:        opType,
-		Class:       operations.OperationClassTask,
+		Class:       operationtype.OperationClassTask,
 		RunHook:     run,
 		Metadata: map[string]any{
 			api.MetadataEntityURL: api.NewURL().Path(version.APIVersion, "instances", req.Name).Project(projectName).String(),
@@ -774,7 +823,7 @@ func createFromCopy(r *http.Request, s *state.State, projectName string, profile
 		return response.InternalError(err)
 	}
 
-	return operations.OperationResponse(op)
+	return response.OperationResponse(op)
 }
 
 func createFromBackup(s *state.State, r *http.Request, projectName string, data io.Reader, pool string, instanceName string, devices map[string]map[string]string) response.Response {
@@ -924,6 +973,14 @@ func createFromBackup(s *state.State, r *http.Request, projectName string, data 
 		err = limits.AllowInstanceCreation(s.GlobalConfig, *restrictions, req)
 		if err != nil {
 			return response.SmartError(err)
+		}
+
+		// Verify snapshot creation is permitted before iterating over individual snapshots.
+		if len(bInfo.Config.Snapshots) > 0 {
+			err = limits.AllowSnapshotCreation(&restrictions.Project)
+			if err != nil {
+				return response.SmartError(err)
+			}
 		}
 
 		for i, snapshot := range bInfo.Config.Snapshots {
@@ -1080,7 +1137,7 @@ func createFromBackup(s *state.State, r *http.Request, projectName string, data 
 		ProjectName: bInfo.Project,
 		EntityURL:   api.NewURL().Path(version.APIVersion, "projects", bInfo.Project),
 		Type:        operationtype.BackupRestore,
-		Class:       operations.OperationClassTask,
+		Class:       operationtype.OperationClassTask,
 		RunHook:     run,
 		Metadata: map[string]any{
 			api.MetadataEntityURL: api.NewURL().Path(version.APIVersion, "instances", bInfo.Name).Project(bInfo.Project).String(),
@@ -1093,7 +1150,7 @@ func createFromBackup(s *state.State, r *http.Request, projectName string, data 
 	}
 
 	revert.Success()
-	return operations.OperationResponse(op)
+	return response.OperationResponse(op)
 }
 
 // instanceProfilesFromNames loads the named profiles from the database and returns them as API
@@ -1150,6 +1207,22 @@ func instanceProfilesFromNames(ctx context.Context, tx *db.ClusterTx, projectNam
 	return profiles, nil
 }
 
+// freeRootDiskDeviceName returns a name for an injected root disk device that does not
+// collide with an existing device in devices, trying "root" first and then "root0",
+// "root1" and so on.
+func freeRootDiskDeviceName(devices deviceConfig.Devices) string {
+	name := "root"
+	for i := range 100 {
+		if devices[name] == nil {
+			break
+		}
+
+		name = "root" + strconv.Itoa(i)
+	}
+
+	return name
+}
+
 // setupInstanceArgs sets the database instance arguments and determines the storage pool to use.
 func setupInstanceArgs(s *state.State, instType instancetype.Type, projectName string, profiles []api.Profile, req *api.InstancesPost) (storagePool string, instArgs *db.InstanceArgs, err error) {
 	// Parse the architecture name
@@ -1194,15 +1267,7 @@ func setupInstanceArgs(s *state.State, instType instancetype.Type, projectName s
 
 		// Make sure that we do not overwrite a device the user is currently using
 		// under the name "root".
-		rootDevName := "root"
-		for i := range 100 {
-			if args.Devices[rootDevName] == nil {
-				break
-			}
-
-			rootDevName = "root" + strconv.Itoa(i)
-			continue
-		}
+		rootDevName := freeRootDiskDeviceName(args.Devices)
 
 		args.Devices[rootDevName] = rootDev
 	} else if localRootDiskDeviceKey != "" && localRootDiskDevice["pool"] == "" {
@@ -1374,6 +1439,7 @@ func instancesPost(d *Daemon, r *http.Request) response.Response {
 	var targetMemberInfo *db.NodeInfo
 	var targetGroupName string
 	var placementGroupName string
+	var imageAuthorizationChecker func(ctx context.Context) error
 
 	// Set to true once we find that the request is currently handled on a member which isn't hosting the source instance.
 	sourceInstOnDifferentMember := false
@@ -1403,29 +1469,9 @@ func instancesPost(d *Daemon, r *http.Request) response.Response {
 			return err
 		}
 
-		// Only replicator runs from the configured cluster link (or internal cluster
-		// notifications forwarded by the coordinator) can create instances in a standby
-		// replica project.
-		if targetProject.ReplicaMode == api.ReplicatorProjectModeStandby && !clusterNotification {
-			expectedCluster := targetProject.Config["replica.cluster"]
-
-			// Verify the request comes from the configured cluster link identity.
-			clusterLink, err := dbCluster.GetClusterLink(ctx, tx.Tx(), expectedCluster)
-			if err != nil {
-				if api.StatusErrorCheck(err, http.StatusNotFound) {
-					return api.StatusErrorf(http.StatusForbidden, "Cannot create instances in a standby replica project")
-				}
-
-				return fmt.Errorf("Failed loading cluster link %q: %w", expectedCluster, err)
-			}
-
-			// Only allow the expected cluster link identity to create instances in the standby replica project.
-			// We can check this using the requestor identity ID, since cluster links always communicate using a named
-			// TLS identity. We need to ensure the identity is not nil - since it can be nil for admin protocols.
-			// (Admins are not allowed to create instances in this project while it is in standby either).
-			if requestor.IdentityID == nil || *requestor.IdentityID != *clusterLink.IdentityID {
-				return api.StatusErrorf(http.StatusForbidden, "Cannot create instances in a standby replica project")
-			}
+		err = project.CheckStandbyReplica(ctx, tx, targetProject, requestor)
+		if err != nil {
+			return err
 		}
 
 		var allMembers []db.NodeInfo
@@ -1514,10 +1560,8 @@ func instancesPost(d *Daemon, r *http.Request) response.Response {
 			}
 
 		case api.SourceTypeImage:
-			// Try to resolve the source image from cache and perform authorization checks.
-			// This is needed to verify the caller has access to the image if it's from a different project,
-			// and to retrieve the image's metadata (such as profiles) so they can be applied to the instance.
-			sourceImage, err = resolveSourceImageFromCache(r, s, tx, targetProject.Name, req.Source, &sourceImageRef, string(req.Type))
+			// Try to resolve the source image from cache.
+			sourceImage, imageAuthorizationChecker, err = resolveSourceImageFromCache(r, s, tx, targetProject.Name, req.Source, &sourceImageRef, string(req.Type))
 			if err != nil {
 				return err
 			}
@@ -1667,6 +1711,15 @@ func instancesPost(d *Daemon, r *http.Request) response.Response {
 		return response.SmartError(err)
 	}
 
+	// Verify the caller has access to the image if it's from a different project, and to retrieve the image's metadata
+	// (such as profiles) so they can be applied to the instance.
+	if imageAuthorizationChecker != nil {
+		err = imageAuthorizationChecker(r.Context())
+		if err != nil {
+			return response.SmartError(err)
+		}
+	}
+
 	poolSupportsInternalCopy := false
 
 	if s.ServerClustered && req.Source.Type == api.SourceTypeCopy && sourceInstPoolName != "" {
@@ -1705,7 +1758,7 @@ func instancesPost(d *Daemon, r *http.Request) response.Response {
 		}
 
 		opAPI := op.Get()
-		return operations.ForwardedOperationResponse(&opAPI)
+		return response.ForwardedOperationResponse(&opAPI)
 	}
 
 	// Record the cluster group as a volatile config key if present.
@@ -1731,7 +1784,7 @@ func instancesPost(d *Daemon, r *http.Request) response.Response {
 		}
 
 		opAPI := op.Get()
-		return operations.ForwardedOperationResponse(&opAPI)
+		return response.ForwardedOperationResponse(&opAPI)
 	}
 
 	// Cases 1b and 2b).

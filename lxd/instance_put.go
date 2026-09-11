@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"maps"
 	"net/http"
 
 	"github.com/google/uuid"
@@ -15,7 +16,6 @@ import (
 	"github.com/canonical/lxd/lxd/instance"
 	"github.com/canonical/lxd/lxd/operations"
 	"github.com/canonical/lxd/lxd/project/limits"
-	"github.com/canonical/lxd/lxd/request"
 	"github.com/canonical/lxd/lxd/response"
 	"github.com/canonical/lxd/lxd/state"
 	"github.com/canonical/lxd/lxd/util"
@@ -63,25 +63,7 @@ func instancePut(d *Daemon, r *http.Request) response.Response {
 
 	s := d.State()
 
-	instanceType, err := urlInstanceTypeDetect(r)
-	if err != nil {
-		return response.SmartError(err)
-	}
-
-	projectName := request.ProjectParam(r)
-
-	// Get the container
-	name := r.PathValue("name")
-	if shared.IsSnapshot(name) {
-		return response.BadRequest(errors.New("Invalid instance name"))
-	}
-
-	// Handle requests targeted to a container on a different node
-	resp, err := forwardedResponseIfInstanceIsRemote(r.Context(), s, projectName, name, instanceType)
-	if err != nil {
-		return response.SmartError(err)
-	}
-
+	projectName, name, resp := forwardedInstanceResponse(s, r)
 	if resp != nil {
 		return resp
 	}
@@ -195,7 +177,7 @@ func instancePut(d *Daemon, r *http.Request) response.Response {
 		ProjectName: projectName,
 		EntityURL:   api.NewURL().Path(version.APIVersion, "instances", name).Project(projectName),
 		Type:        opType,
-		Class:       operations.OperationClassTask,
+		Class:       operationtype.OperationClassTask,
 		RunHook:     do,
 	}
 
@@ -205,7 +187,7 @@ func instancePut(d *Daemon, r *http.Request) response.Response {
 	}
 
 	revert.Success()
-	return operations.OperationResponse(op)
+	return response.OperationResponse(op)
 }
 
 func instanceSnapRestore(ctx context.Context, s *state.State, projectName string, name string, req api.InstancePut, op *operations.Operation) error {
@@ -237,8 +219,15 @@ func instanceSnapRestore(ctx context.Context, s *state.State, projectName string
 		snapProfileNames = append(snapProfileNames, profile.Name)
 	}
 
+	// Copy the snapshot's config rather than using it directly, and strip
+	// "volatile.attached_volumes": it's set by LXD on the snapshot itself for
+	// multi-volume restores and is never present on the live instance, so comparing
+	// it as-is would always be rejected as an unexpected volatile key change.
+	snapConfigMap := maps.Clone(source.LocalConfig())
+	delete(snapConfigMap, "volatile.attached_volumes")
+
 	snapConfig := api.InstancePut{
-		Config:   source.LocalConfig(),
+		Config:   snapConfigMap,
 		Devices:  source.LocalDevices().CloneNative(),
 		Profiles: snapProfileNames,
 	}

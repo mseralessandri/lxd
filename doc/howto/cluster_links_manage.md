@@ -56,7 +56,7 @@ See [`GET /1.0/cluster/links/{name}/state`](swagger:/cluster-links/{name}/state/
 
 ````
 ````{group-tab} UI
-   For a single-node cluster, click {guilabel}`Server` in the navigation sidebar, then select the {guilabel}`Cluster links` tab in the main content pane. Otherwise, click {guilabel}`Clustering` in the navigation sidebar, then select {guilabel}`Links` from the expanded drop-down list.
+   Click {guilabel}`Clustering` in the navigation sidebar, then select {guilabel}`Links` from the expanded drop-down list.
 ````
 `````
 
@@ -79,10 +79,10 @@ Alternatively, for bidirectional links you can specify an authentication group w
 lxc cluster link create <cluster-link-name> --auth-group <group name>
 ```
 
-For unidirectional links, `--auth-group` is not supported on the initiating cluster (Cluster A has no identity for B). Specify the auth group on the target cluster (Cluster B) when issuing the identity token:
+For unidirectional links, `--auth-group` is not supported on the initiating cluster (Cluster A has no identity for B) when running `lxc cluster link create`. Instead, specify the authentication group on the target cluster (Cluster B) with `--group` when issuing the identity token with `lxc auth identity create`:
 
 ```bash
-lxc auth identity create cluster-link/<name-for-cluster-a> --auth-group <group name>
+lxc auth identity create cluster-link/<name-for-cluster-a> --group <group name>
 ```
 
 (howto-cluster-links-configure)=
@@ -153,7 +153,7 @@ You can also update a single configuration option for a cluster link.
 See [`PATCH /1.0/cluster/links/{name}`](swagger:/cluster-links/{name}/cluster_link_patch) for more information.
 ````
 ````{group-tab} UI
-   For a single-node cluster, click {guilabel}`Server` in the navigation sidebar, then select the {guilabel}`Cluster links` tab in the main content pane. Otherwise, click {guilabel}`Clustering` in the navigation sidebar, then select {guilabel}`Links` from the expanded drop-down list.
+   Click {guilabel}`Clustering` in the navigation sidebar, then select {guilabel}`Links` from the expanded drop-down list.
 
    To edit a cluster link, click on the pencil icon at the end of that cluster link's row.
 
@@ -178,7 +178,7 @@ To delete a cluster link, run:
 See [`DELETE /1.0/cluster/links/{name}`](swagger:/cluster-links/{name}/cluster_link_delete) for more information.
 ````
 ````{group-tab} UI
-   For a single-node cluster, click {guilabel}`Server` in the navigation sidebar, then select the {guilabel}`Cluster links` tab in the main content pane. Otherwise, click {guilabel}`Clustering` in the navigation sidebar, then select {guilabel}`Links` from the expanded drop-down list.
+   Click {guilabel}`Clustering` in the navigation sidebar, then select {guilabel}`Links` from the expanded drop-down list.
 
    To delete a cluster link, click on the trash can icon at the end of that cluster link's row.
 
@@ -192,4 +192,5 @@ The effect of deleting a cluster link varies by type:
 
 - **Bidirectional**: Deleting on one cluster removes the trust and identity only on that cluster. The other cluster retains its identity and trust until you also delete the link there. To fully disconnect, run the command on both clusters.
 - **Unidirectional**: Deleting on Cluster A removes only A's link row. Cluster B retains its identity for A until B explicitly revokes it with `lxc auth identity delete cluster-link/<name-for-cluster-a>`.
+- **Public**: Deleting on Cluster A removes A's link row. Since B has no knowledge of the link, no further cleanup is required.
 ```

@@ -6,6 +6,7 @@ test_devlxd() {
   lxd sql global "UPDATE images SET cached=0 WHERE fingerprint=\"${fingerprint}\""
 
   lxc launch testimage devlxd -c security.devlxd=false -c boot.autostart=true
+  setup_instance_gocoverage devlxd
 
   ! lxc exec devlxd -- test -S /dev/lxd/sock || false
   lxc config unset devlxd security.devlxd
@@ -147,8 +148,8 @@ EOF
   kill_go_proc "${client_websocket}"
   kill_go_proc "${client_stream}"
 
-  lxc monitor --type=lifecycle > "${TEST_DIR}/devlxd.log" &
-  monitorDevlxdPID=$!
+  lxc_monitor_start "${TEST_DIR}/devlxd.log" --type=lifecycle
+  monitorDevlxdPID="${LXC_MONITOR_PID}"
 
   # Test instance Ready state
   [ "$(lxc list -f csv -c s devlxd)" = "RUNNING" ]
@@ -177,8 +178,8 @@ EOF
   # volatile.last_state.ready should be unset during daemon init
   [ -z "$(lxc config get devlxd volatile.last_state.ready || echo fail)" ]
 
-  lxc monitor --type=lifecycle > "${TEST_DIR}/devlxd.log" &
-  monitorDevlxdPID=$!
+  lxc_monitor_start "${TEST_DIR}/devlxd.log" --type=lifecycle
+  monitorDevlxdPID="${LXC_MONITOR_PID}"
 
   lxc exec devlxd -- devlxd-client ready-state true
   [ "$(lxc config get devlxd volatile.last_state.ready)" = "true" ]
@@ -1003,7 +1004,7 @@ runcmd:
   lxc stop -f v1
   [ "$(lxc config get v1 volatile.last_state.ready)" = "false" ]
 
-  # TODO: add nested virt part from lxd-ci test
+  # TODO: add nested virt part from test/snap/devlxd
 
   # Cleanup
   lxc image delete "$(lxc config get v1 volatile.base_image)"

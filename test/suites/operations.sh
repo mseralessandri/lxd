@@ -30,7 +30,7 @@ test_get_operations() {
     test "${proj1_count}" -eq 1
     proj2_count=$(jq --exit-status '[.success[] | select(.description == "Executing command")] | length' <<< "${proj2_full_ops_json}")
     test "${proj2_count}" -eq 1
-    all_count=$(jq --exit-status '[.success[] | select(.description == "Executing command")] | length' <<< "${all_full_ops_json}")
+    all_count=$(jq --exit-status '[.success[] | select(.description == "Executing command" and (.metadata.entity_url | test("project=op-proj\\d$")?))] | length' <<< "${all_full_ops_json}")
     test "${all_count}" -eq 2
 
     proj1_op_id=$(jq --exit-status -r '.success[] | select(.description == "Executing command") | .id' <<< "${proj1_full_ops_json}")
@@ -52,16 +52,44 @@ test_get_operations() {
   )
 }
 
+test_bulk_operation_children() {
+  ensure_import_testimage
+
+  (
+    set -e
+
+    # Create two containers to generate a bulk operation with child operations.
+    lxc launch testimage c1
+    lxc launch testimage c2
+
+    # Trigger a bulk state change, which creates a parent operation with one child per instance.
+    bulk_op_id=$(lxc query -X PUT /1.0/instances -d '{"state": {"action": "stop"}}' | jq -r --exit-status '.id')
+
+    # Wait for the bulk operation to complete.
+    lxc query "/1.0/operations/${bulk_op_id}/wait?timeout=60" > /dev/null
+
+    # Assert the CHILDREN column in lxc operation list shows the correct child count.
+    child_count=$(lxc operation list --format json | jq --exit-status --arg id "${bulk_op_id}" '.[] | select(.id == $id) | .child_count')
+    [ "${child_count}" -eq 2 ]
+
+    # Assert child_count is accurate on a non-recursive single GET (no recursion=1 required).
+    api_child_count=$(lxc query "/1.0/operations/${bulk_op_id}" | jq --exit-status '.child_count')
+    [ "${api_child_count}" -eq 2 ]
+
+    # Assert lxc operation list-children shows the expected number of child operations.
+    list_children_count=$(lxc operation list-children "${bulk_op_id}" --format json | jq --exit-status 'length')
+    [ "${list_children_count}" -eq 2 ]
+
+    lxc delete c1 --force
+    lxc delete c2 --force
+  )
+}
+
 test_operations_conflict_reference() {
   conflictRef="test-conflict-ref"
 
-  # operation-wait requires instance for entity_type
-  lxc init --empty c1
-
   # Create two operations with the same conflict_reference. The second creation should fail.
   # op_type 75 is "Wait" operation.
-  lxc query -X POST '/internal/testing/operation-wait' -d '{"duration": "5s", "op_class": 1, "op_type": 75, "entity_url": "/1.0/instances/c1", "conflict_reference": "'"${conflictRef}"'"}'
-  ! lxc query -X POST '/internal/testing/operation-wait' -d '{"duration": "5s", "op_class": 1, "op_type": 75, "entity_url": "/1.0/instances/c1", "conflict_reference": "'"${conflictRef}"'"}' || false
-
-  lxc delete c1 --force
+  lxc query -X POST '/internal/testing/operation-wait' -d '{"duration": "5s", "op_class": 1, "op_type": 75, "conflict_reference": "'"${conflictRef}"'"}'
+  ! lxc query -X POST '/internal/testing/operation-wait' -d '{"duration": "5s", "op_class": 1, "op_type": 75, "conflict_reference": "'"${conflictRef}"'"}' || false
 }

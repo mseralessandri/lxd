@@ -188,7 +188,7 @@ The following bug fixes are included in this release.
 - [{spellexception}`Project restriction bypass in instance copy across projects (CVE-2026-55622)`](https://github.com/canonical/lxd/security/advisories/GHSA-qx75-2p3r-pwm5)
 - [{spellexception}`Project restriction bypass for custom volume copy across projects (CVE-2026-55621)`](https://github.com/canonical/lxd/security/advisories/GHSA-7mr3-28h5-m5vx)
 - [{spellexception}`Restricted project bypass leading to arbitrary command execution (CVE-2026-48751)`](https://github.com/canonical/lxd/security/advisories/GHSA-47w9-6r3f-938g)
-- [{spellexception}`Arbitrary file write on host via `exec-output` symlink in crafted image (CVE-2026-48750)`](https://github.com/canonical/lxd/security/advisories/GHSA-9j25-mm2h-2f76)
+- [{spellexception}`Arbitrary file write on host via exec-output symlink in crafted image (CVE-2026-48750)`](https://github.com/canonical/lxd/security/advisories/GHSA-9j25-mm2h-2f76)
 - [{spellexception}`Arbitrary file read+write on host via templates/ symlink in malicious image (CVE-2026-48752)`](https://github.com/canonical/lxd/security/advisories/GHSA-jpf8-86f3-wp38)
 - [{spellexception}`Arbitrary file read+write on host via rootfs/ symlink in malicious image (CVE-2026-48749)`](https://github.com/canonical/lxd/security/advisories/GHSA-vghh-5rfx-xhq8)
 - [{spellexception}`Argument injection in backup compression algorithm leading to AFW and ACE (CVE-2026-48755)`](https://github.com/canonical/lxd/security/advisories/GHSA-fmc8-p6q7-75cc)
@@ -226,6 +226,20 @@ The following bug fixes are included in this release.
 - [{spellexception}`Mount Ceph RBD snapshots read-only to support modern ext4`](https://github.com/canonical/lxd/pull/18469)
 - [{spellexception}`Work with modern LVM`](https://github.com/canonical/lxd/pull/18463)
 - [{spellexception}`Add missing content types for storage volume POST`](https://github.com/canonical/lxd/pull/18457)
+
+### Security fixes in interim snap release `6.9-ab8fad2`
+
+The following security issues were fixed in the interim snap release `6.9-ab8fad2`:
+
+- [{spellexception}`Instance template path traversal allows arbitrary host file write as root (CVE-2026-66897)`](https://github.com/canonical/lxd/security/advisories/GHSA-q39m-8fx9-42fv)
+- [{spellexception}`Arbitrary file read and write via image metadata.yaml symlink (CVE-2026-63293)`](https://github.com/canonical/lxd/security/advisories/GHSA-j825-cg34-5fr5)
+- [{spellexception}`Root command execution via image backup.yaml symlink (CVE-2026-63294)`](https://github.com/canonical/lxd/security/advisories/GHSA-fv82-v4fj-mm4m)
+- [{spellexception}`NVIDIA configuration validation bypass for nvidia.driver.capabilities (CVE-2026-63298)`](https://github.com/canonical/lxd/security/advisories/GHSA-vfh7-q59q-54v2)
+- [{spellexception}`Restricted project bypass for security.idmap.isolated defaults (CVE-2026-63295)`](https://github.com/canonical/lxd/security/advisories/GHSA-7vp9-3vmp-c5jm)
+- [{spellexception}`Project restriction bypass via instance migration config override (CVE-2026-63296)`](https://github.com/canonical/lxd/security/advisories/GHSA-gcr9-5q6r-w625)
+- [{spellexception}`Storage volume cross-project move and restore bypass project disk limits (CVE-2026-63299)`](https://github.com/canonical/lxd/security/advisories/GHSA-5h78-p252-989h)
+- [{spellexception}`Cross-project cluster migration bypasses project restrictions (CVE-2026-62420)`](https://github.com/canonical/lxd/security/advisories/GHSA-v9wr-9r7q-fh4g)
+- [{spellexception}`Cross-project instance move bypasses project restrictions (CVE-2026-63300)`](https://github.com/canonical/lxd/security/advisories/GHSA-5g5r-wh97-qcq2)
 
 (ref-release-notes-6.9-incompatible)=
 ## Backwards-incompatible changes
@@ -277,7 +291,7 @@ There is currently no native LXD configuration workaround.
 
 For applications running on `core26` and newer bases, `snapd` enforces stricter process tracking and device cgroup validations that rely on an active `systemd` user session.
 
-If you run `lxc` commands inside environments where a user identity was switched without spawning a corresponding user session (e.g., non-interactive scripts, or mechanisms like `sudo`, `su`, or `runuser`), the execution will fail with the following error:
+If you run `lxc` commands inside environments where a user identity was switched without spawning a corresponding user session (for example, non-interactive scripts or mechanisms like `sudo`, `su`, or `runuser`), the execution will fail with the following error:
 
 ```
 The user ubuntu cannot run snap applications on this system.
@@ -325,5 +339,5 @@ The source tarballs and binary clients can be found on our [download page](https
 Binary packages are also available for:
 
 - **Linux:** `snap install lxd --channel=6/stable`
-- **MacOS client:** `brew install lxc`
+- **macOS client:** `brew install lxc`
 - **Windows client:** `choco install lxc`

@@ -963,7 +963,6 @@ test_clustering_storage() {
 
     # Copy the container without specifying a target, it will be placed on node2
     # since it's the one with the least number of containers (0 vs 1)
-    sleep 6 # Wait for pending operations to be removed from the database
     LXD_DIR="${LXD_ONE_DIR}" lxc copy foo bar
     [ "$(LXD_DIR="${LXD_ONE_DIR}" lxc list -f csv -c L bar)" = "node2" ]
 
@@ -1290,6 +1289,53 @@ test_clustering_network() {
 
   echo "Clean up physical networks."
   LXD_DIR="${LXD_ONE_DIR}" lxc network delete "${net2}"
+  LXD_DIR="${LXD_ONE_DIR}" lxc network delete "${net1}"
+
+  sub_test "Test VLAN-aware sharing of physical network parent interfaces"
+
+  # Create a physical network net1 on VLAN 10 using parent i1 on both members.
+  LXD_DIR="${LXD_ONE_DIR}" lxc network create "${net1}" --type=physical parent=i1 --target=node1
+  LXD_DIR="${LXD_ONE_DIR}" lxc network create "${net1}" --type=physical parent=i1 --target=node2
+  LXD_DIR="${LXD_ONE_DIR}" lxc network create "${net1}" --type=physical vlan=10
+  LXD_DIR="${LXD_ONE_DIR}" lxc network show "${net1}" | grep -xF 'status: Created'
+
+  # Check that the same parent on both members can be shared on a different VLAN.
+  LXD_DIR="${LXD_ONE_DIR}" lxc network create "${net2}" --type=physical parent=i1 --target=node1
+  LXD_DIR="${LXD_ONE_DIR}" lxc network create "${net2}" --type=physical parent=i1 --target=node2
+  LXD_DIR="${LXD_ONE_DIR}" lxc network create "${net2}" --type=physical vlan=20
+  LXD_DIR="${LXD_ONE_DIR}" lxc network show "${net2}" | grep -xF 'status: Created'
+  LXD_DIR="${LXD_ONE_DIR}" lxc network delete "${net2}"
+
+  # Check that the same parent and same VLAN cannot be shared on both members.
+  LXD_DIR="${LXD_ONE_DIR}" lxc network create "${net2}" --type=physical parent=i1 --target=node1
+  LXD_DIR="${LXD_ONE_DIR}" lxc network create "${net2}" --type=physical parent=i1 --target=node2
+  ! LXD_DIR="${LXD_ONE_DIR}" lxc network create "${net2}" --type=physical vlan=10 || false
+  LXD_DIR="${LXD_ONE_DIR}" lxc network show "${net2}" | grep -xF 'status: Errored'
+  LXD_DIR="${LXD_ONE_DIR}" lxc network delete "${net2}"
+
+  # Check that a network without a VLAN cannot share a parent already in use on a VLAN.
+  LXD_DIR="${LXD_ONE_DIR}" lxc network create "${net2}" --type=physical parent=i1 --target=node1
+  LXD_DIR="${LXD_ONE_DIR}" lxc network create "${net2}" --type=physical parent=i1 --target=node2
+  ! LXD_DIR="${LXD_ONE_DIR}" lxc network create "${net2}" --type=physical || false
+  LXD_DIR="${LXD_ONE_DIR}" lxc network show "${net2}" | grep -xF 'status: Errored'
+  LXD_DIR="${LXD_ONE_DIR}" lxc network delete "${net2}"
+
+  # Check that a VLAN conflict on another member's parent interface alone is detected.
+  # net2 uses the free parent i2 on node1 but parent i1 on node2, where net1 already uses VLAN 10.
+  LXD_DIR="${LXD_ONE_DIR}" lxc network create "${net2}" --type=physical parent=i2 --target=node1
+  LXD_DIR="${LXD_ONE_DIR}" lxc network create "${net2}" --type=physical parent=i1 --target=node2
+  ! LXD_DIR="${LXD_ONE_DIR}" lxc network create "${net2}" --type=physical vlan=10 || false
+  LXD_DIR="${LXD_ONE_DIR}" lxc network show "${net2}" | grep -xF 'status: Errored'
+  LXD_DIR="${LXD_ONE_DIR}" lxc network delete "${net2}"
+
+  # Check that a different VLAN on a parent shared only via another member is allowed.
+  LXD_DIR="${LXD_ONE_DIR}" lxc network create "${net2}" --type=physical parent=i2 --target=node1
+  LXD_DIR="${LXD_ONE_DIR}" lxc network create "${net2}" --type=physical parent=i1 --target=node2
+  LXD_DIR="${LXD_ONE_DIR}" lxc network create "${net2}" --type=physical vlan=30
+  LXD_DIR="${LXD_ONE_DIR}" lxc network show "${net2}" | grep -xF 'status: Created'
+  LXD_DIR="${LXD_ONE_DIR}" lxc network delete "${net2}"
+
+  # Clean up.
   LXD_DIR="${LXD_ONE_DIR}" lxc network delete "${net1}"
 
   echo "Test concurrent creation of different bridge networks."
@@ -3428,15 +3474,19 @@ test_clustering_evacuation() {
     delay=0.2
     max_attempts=60
 
+    # Check if the operation is still running in a loop. The jq command is a little complex because the response from
+    # /1.0/operations?recursion=1 is an object where each key is the lowercased operation status, and each value is an
+    # array of operations whose status matches the key. The command flattens this into a single array, then unwraps the
+    # array to get a list of objects, then selects only the evacuation operation by its description, and checks the status code.
     for i in $(seq "${max_attempts}"); do
-      if ! LXD_DIR="${lxd_dir}" lxc operation list --format csv | grep -F "Evacuating cluster member" >/dev/null; then
+      if LXD_DIR="${lxd_dir}" lxc query /1.0/operations?recursion=1 | jq --exit-status '[.[]] | flatten | .[] | select(.description == "Evacuating cluster member") | .status_code >= 200'; then
         return 0
       fi
 
       sleep "${delay}"
     done
 
-    echo "Evacuation operation still present after ${i} attempts (~${delay}s interval)"
+    echo "Evacuation operation still running after ${i} attempts (~${delay}s interval)"
     return 1
   }
   echo "Create cluster with 3 nodes"
@@ -3993,8 +4043,8 @@ test_clustering_edit_configuration() {
   # shellcheck disable=SC2154
   LXD_NETNS="${ns6}" respawn_lxd "${LXD_SIX_DIR}" true
 
-  # Let the heartbeats catch up
-  sleep 11
+  # Wait for all members to be back online.
+  wait_all_members_online "${LXD_SIX_DIR}"
 
   # Sanity check of the automated backup
   # We can't check that the backup has the same files as even LXD_ONE_DIR, because
@@ -4018,7 +4068,6 @@ test_clustering_edit_configuration() {
   LXD_DIR="${LXD_FOUR_DIR}"  lxc info --target node1 | grep -F "server_name: node1"
   LXD_DIR="${LXD_FIVE_DIR}"  lxc info --target node1 | grep -F "server_name: node1"
   LXD_DIR="${LXD_SIX_DIR}"   lxc info --target node1 | grep -F "server_name: node1"
-  ! LXD_DIR="${LXD_ONE_DIR}" lxc cluster list | grep -F "No heartbeat" || false
 
   # Clean up
   shutdown_lxd "${LXD_ONE_DIR}"
@@ -4489,12 +4538,12 @@ test_clustering_events() {
   [ "$(LXD_DIR="${LXD_ONE_DIR}" lxc list -f csv -c L c1)" = "node1" ]
   LXD_DIR="${LXD_ONE_DIR}" lxc launch testimage c2 --target=node2
 
-  LXD_DIR="${LXD_ONE_DIR}" stdbuf -oL lxc monitor --type=lifecycle > "${TEST_DIR}/node1.log" &
-  monitorNode1PID=$!
-  LXD_DIR="${LXD_TWO_DIR}" stdbuf -oL lxc monitor --type=lifecycle > "${TEST_DIR}/node2.log" &
-  monitorNode2PID=$!
-  LXD_DIR="${LXD_THREE_DIR}" stdbuf -oL lxc monitor --type=lifecycle > "${TEST_DIR}/node3.log" &
-  monitorNode3PID=$!
+  LXD_DIR="${LXD_ONE_DIR}" lxc_monitor_start "${TEST_DIR}/node1.log" --type=lifecycle
+  monitorNode1PID="${LXC_MONITOR_PID}"
+  LXD_DIR="${LXD_TWO_DIR}" lxc_monitor_start "${TEST_DIR}/node2.log" --type=lifecycle
+  monitorNode2PID="${LXC_MONITOR_PID}"
+  LXD_DIR="${LXD_THREE_DIR}" lxc_monitor_start "${TEST_DIR}/node3.log" --type=lifecycle
+  monitorNode3PID="${LXC_MONITOR_PID}"
 
   # Restart instance generating restart lifecycle event.
   LXD_DIR="${LXD_ONE_DIR}" lxc restart -f c1
@@ -5533,6 +5582,22 @@ test_clustering_link_auth() {
   LXD_DIR="${LXD_ONE_DIR}" lxc cluster enable node1
   [ "$(LXD_DIR="${LXD_ONE_DIR}" lxc cluster list | grep -cwF 'node1')" = 1 ]
 
+  sub_test "Check client tokens retain the core HTTPS address"
+
+  LXD_ONE_CORE_ADDR="127.0.0.1:$(local_tcp_port)"
+  LXD_DIR="${LXD_ONE_DIR}" lxc config set core.https_address "${LXD_ONE_CORE_ADDR}"
+  LXD_DIR="${LXD_ONE_DIR}" lxc auth identity create tls/link-address-client --quiet | base64 -d | jq --exit-status --arg address "${LXD_ONE_CORE_ADDR}" '.addresses == [$address]'
+  LXD_DIR="${LXD_ONE_DIR}" lxc auth identity delete tls/link-address-client
+
+  sub_test "Check cluster link tokens work without a core HTTPS listener"
+
+  LXD_DIR="${LXD_ONE_DIR}" lxc config unset core.https_address
+  LXD_DIR="${LXD_ONE_DIR}" lxc cluster link create cluster-only --quiet | base64 -d | jq --exit-status --arg address "${LXD_ONE_ADDR}" '.addresses == [$address]'
+  LXD_DIR="${LXD_ONE_DIR}" lxc cluster link delete cluster-only
+
+  # Keep the member address explicit while exposing the core API on all IPv4 interfaces.
+  LXD_DIR="${LXD_ONE_DIR}" lxc config set core.https_address "0.0.0.0:${LXD_ONE_ADDR##*:}"
+
   sub_test "Check local cluster link deletion with pending identity"
 
   # Create pending cluster link on LXD_ONE
@@ -5556,6 +5621,9 @@ test_clustering_link_auth() {
   # Create pending cluster link on LXD_ONE
   LXD_ONE_TRUST_TOKEN="$(LXD_DIR="${LXD_ONE_DIR}" lxc cluster link create lxd_two --quiet)"
 
+  sub_test "Check cluster link token advertises only the cluster address"
+  echo "${LXD_ONE_TRUST_TOKEN}" | base64 -d | jq --exit-status --arg address "${LXD_ONE_ADDR}" '.addresses == [$address]'
+
   # Check that the cluster link identity on LXD_ONE is pending
   [ "$(LXD_DIR="${LXD_ONE_DIR}" lxc auth identity list --format csv | grep -cF 'Cluster link certificate (pending)')" = 1 ]
 
@@ -5568,9 +5636,17 @@ test_clustering_link_auth() {
   # Get the address of LXD_TWO.
   LXD_TWO_ADDR="$(LXD_DIR="${LXD_TWO_DIR}" lxc config get core.https_address)"
 
+  sub_test "Check standalone cluster link tokens use the core HTTPS address"
+
+  LXD_DIR="${LXD_TWO_DIR}" lxc cluster link create standalone-address --quiet | base64 -d | jq --exit-status --arg address "${LXD_TWO_ADDR}" '.addresses == [$address]'
+  LXD_DIR="${LXD_TWO_DIR}" lxc cluster link delete standalone-address
+
   # Enable clustering on LXD_TWO.
   LXD_DIR="${LXD_TWO_DIR}" lxc cluster enable node2
   [ "$(LXD_DIR="${LXD_TWO_DIR}" lxc cluster list | grep -cwF 'node2')" = 1 ]
+
+  # Keep the member address explicit while exposing the core API on all IPv4 interfaces.
+  LXD_DIR="${LXD_TWO_DIR}" lxc config set core.https_address "0.0.0.0:${LXD_TWO_ADDR##*:}"
 
   sub_test "Check failed cluster link activation rolls back local trust state"
 
@@ -5611,6 +5687,15 @@ test_clustering_link_auth() {
 
   # Check that LXD_ONE trusts LXD_TWO
   LXD_CONF="${LXD_TWO_DIR}" CERTNAME="cluster" CACERT="${LXD_ONE_DIR}/cluster.crt" trusted_curl "https://${LXD_ONE_ADDR}/1.0" | jq --exit-status '.metadata.auth == "trusted"'
+
+  sub_test "Check cluster link addresses after activation and refresh"
+
+  LXD_DIR="${LXD_ONE_DIR}" lxc query /1.0/cluster/links/lxd_two | jq --exit-status --arg address "${LXD_TWO_ADDR}" '.config["volatile.addresses"] == $address'
+  LXD_DIR="${LXD_TWO_DIR}" lxc query /1.0/cluster/links/lxd_one | jq --exit-status --arg address "${LXD_ONE_ADDR}" '.config["volatile.addresses"] == $address'
+  LXD_DIR="${LXD_ONE_DIR}" lxc query -X POST --raw --wait /internal/testing/cluster/link/refresh-volatile-addresses
+  LXD_DIR="${LXD_TWO_DIR}" lxc query -X POST --raw --wait /internal/testing/cluster/link/refresh-volatile-addresses
+  LXD_DIR="${LXD_ONE_DIR}" lxc query /1.0/cluster/links/lxd_two | jq --exit-status --arg address "${LXD_TWO_ADDR}" '.config["volatile.addresses"] == $address'
+  LXD_DIR="${LXD_TWO_DIR}" lxc query /1.0/cluster/links/lxd_one | jq --exit-status --arg address "${LXD_ONE_ADDR}" '.config["volatile.addresses"] == $address'
 
   sub_test "Check cluster link config get/set/unset"
 
@@ -5684,6 +5769,12 @@ test_clustering_link_info() {
   cert="$(cert_to_yaml "${LXD_ONE_DIR}/cluster.crt")"
   spawn_lxd_and_join_cluster "${cert}" 5 1 "${LXD_ONE_DIR}"
   LXD_DIR="${LXD_THREE_DIR}" lxc query -X POST --raw --wait /internal/testing/cluster/link/refresh-volatile-addresses
+
+  sub_test "Check refreshed link addresses match cluster membership"
+
+  local member_addresses
+  member_addresses="$(LXD_DIR="${LXD_ONE_DIR}" lxc query '/1.0/cluster/members?recursion=1' | jq --exit-status '[.[].url | ltrimstr("https://")] | sort')"
+  LXD_DIR="${LXD_THREE_DIR}" lxc query /1.0/cluster/links/lxd_one | jq --exit-status --argjson addresses "${member_addresses}" '(.config["volatile.addresses"] | split(",") | sort) == $addresses'
 
   sub_test "Check cluster link info reports active members"
 
@@ -5868,7 +5959,7 @@ test_clustering_replicator_basic() {
 
   LXD_DIR="${LXD_ONE_DIR}" lxc replicator run my-replicator --project replicator-project
   bulk_op="$(LXD_DIR="${LXD_ONE_DIR}" lxc query -X GET '/1.0/operations?project=replicator-project&recursion=2' | jq --exit-status '.. | objects | select(.description == "Running replicator")')"
-  jq --exit-status '([., (.children? // [])[]] | length) == 4 and .status == "Success" and ((.children // []) | length) == 3 and (all(.children[]; .status == "Success"))' <<< "${bulk_op}"
+  jq --exit-status '([., (.children? // [])[]] | length) == 8 and .status == "Success" and .child_count == 7 and (all(.children[]; .status == "Success"))' <<< "${bulk_op}"
   LXD_DIR="${LXD_TWO_DIR}" lxc list --project replicator-project -f csv -c ns | grep -xF 'c1,STOPPED'
   LXD_DIR="${LXD_TWO_DIR}" lxc list --project replicator-project -f csv -c ns | grep -xF 'c2,STOPPED'
   LXD_DIR="${LXD_TWO_DIR}" lxc list --project replicator-project -f csv -c ns | grep -xF 'c3,STOPPED'
@@ -5890,7 +5981,7 @@ test_clustering_replicator_basic() {
   # (delete + recreate) existing instances and complete successfully.
   LXD_DIR="${LXD_ONE_DIR}" lxc replicator run my-replicator --project replicator-project
   bulk_op="$(LXD_DIR="${LXD_ONE_DIR}" lxc query -X GET '/1.0/operations?project=replicator-project&recursion=2' | jq --exit-status '[.. | objects | select(.description == "Running replicator")] | max_by(.created_at)')"
-  jq --exit-status '([., (.children? // [])[]] | length) == 4 and .status == "Success" and ((.children // []) | length) == 3 and (all(.children[]; .status == "Success"))' <<< "${bulk_op}"
+  jq --exit-status '([., (.children? // [])[]] | length) == 8 and .status == "Success" and .child_count == 7 and (all(.children[]; .status == "Success"))' <<< "${bulk_op}"
   LXD_DIR="${LXD_TWO_DIR}" lxc list --project replicator-project -f csv -c ns | grep -xF 'c1,STOPPED'
   LXD_DIR="${LXD_TWO_DIR}" lxc list --project replicator-project -f csv -c ns | grep -xF 'c2,STOPPED'
   LXD_DIR="${LXD_TWO_DIR}" lxc list --project replicator-project -f csv -c ns | grep -xF 'c3,STOPPED'
@@ -5903,7 +5994,7 @@ test_clustering_replicator_basic() {
   LXD_DIR="${LXD_TWO_DIR}" lxc delete c1 c2 c3 --project replicator-project
   LXD_DIR="${LXD_ONE_DIR}" lxc replicator run my-replicator --project replicator-project
   bulk_op="$(LXD_DIR="${LXD_ONE_DIR}" lxc query -X GET '/1.0/operations?project=replicator-project&recursion=2' | jq --exit-status '[.. | objects | select(.description == "Running replicator")] | max_by(.created_at)')"
-  jq --exit-status '([., (.children? // [])[]] | length) == 4 and .status == "Success" and ((.children // []) | length) == 3 and (all(.children[]; .status == "Success"))' <<< "${bulk_op}"
+  jq --exit-status '([., (.children? // [])[]] | length) == 8 and .status == "Success" and .child_count == 7 and (all(.children[]; .status == "Success"))' <<< "${bulk_op}"
   LXD_DIR="${LXD_TWO_DIR}" lxc project unset replicator-project restricted
 
   sub_test "Verify concurrent replicator runs are rejected"
@@ -6009,7 +6100,7 @@ test_clustering_replicator_scheduled() {
 
   local scheduled_op
   scheduled_op="$(LXD_DIR="${LXD_ONE_DIR}" lxc query -X GET '/1.0/operations?project=replicator-project&recursion=2' | jq --exit-status '[.. | objects | select(.description == "Running replicator")] | max_by(.created_at)')"
-  jq --exit-status '([., (.children? // [])[]] | length) == 2 and .status == "Success" and ((.children // []) | length) == 1 and (all(.children[]; .status == "Success"))' <<< "${scheduled_op}"
+  jq --exit-status '([., (.children? // [])[]] | length) == 4 and .status == "Success" and .child_count == 3 and (all(.children[]; .status == "Success"))' <<< "${scheduled_op}"
 
   sub_test "Verify scheduler skips replicator when source project is not in leader mode"
 
@@ -6083,7 +6174,11 @@ test_clustering_replicator_dr() {
   LXD_DIR="${LXD_ONE_DIR}" lxc init --empty c2 --project replicator-project -d "${SMALL_ROOT_DISK}"
   LXD_DIR="${LXD_ONE_DIR}" lxc replicator run my-replicator --project replicator-project
   bulk_op="$(LXD_DIR="${LXD_ONE_DIR}" lxc query -X GET '/1.0/operations?project=replicator-project&recursion=2' | jq --exit-status '[.. | objects | select(.description == "Running replicator")] | max_by(.created_at)')"
-  jq --exit-status '([., (.children? // [])[]] | length) == 3 and .status == "Success" and ((.children // []) | length) == 2 and (all(.children[]; .status == "Success"))' <<< "${bulk_op}"
+  jq --exit-status '([., (.children? // [])[]] | length) == 6 and .status == "Success" and .child_count == 5 and (all(.children[]; .status == "Success"))' <<< "${bulk_op}"
+  # Each instance replication child operation names the instance it replicates.
+  jq --exit-status '[.children[] | select(.description == "Replicating instance") | .metadata.entity_url] | (length == 2 and all(test("^/1.0/instances/c\\d\\?project=replicator-project$")))' <<< "${bulk_op}"
+  # The finalization stage references the replicator URL in its metadata
+  jq --exit-status '[.children[] | select(.description == "Finalizing replicator") | .metadata.entity_url] | (length == 1 and .[0] == "/1.0/replicators/my-replicator?project=replicator-project")' <<< "${bulk_op}"
   LXD_DIR="${LXD_TWO_DIR}" lxc list --project replicator-project -f csv -c ns | grep -xF 'c1,STOPPED'
   LXD_DIR="${LXD_TWO_DIR}" lxc list --project replicator-project -f csv -c ns | grep -xF 'c2,STOPPED'
 
@@ -6158,7 +6253,13 @@ test_clustering_replicator_dr() {
   LXD_DIR="${LXD_ONE_DIR}" lxc stop c1 --force --project replicator-project
   LXD_DIR="${LXD_ONE_DIR}" lxc replicator run my-replicator --restore --project replicator-project
   bulk_op="$(LXD_DIR="${LXD_ONE_DIR}" lxc query -X GET '/1.0/operations?project=replicator-project&recursion=2' | jq --exit-status '[.. | objects | select(.description == "Running replicator")] | max_by(.created_at)')"
-  jq --exit-status '([., (.children? // [])[]] | length) == 4 and .status == "Success" and ((.children // []) | length) == 3 and (all(.children[]; .status == "Success"))' <<< "${bulk_op}"
+  jq --exit-status '([., (.children? // [])[]] | length) == 5 and .status == "Success" and .child_count == 4 and (all(.children[]; .status == "Success"))' <<< "${bulk_op}"
+  # Restore child operations name the project, because c3 was created on the current leader cluster
+  # during failover and is missing locally until the operation creates it. The instance each child
+  # restores is reported in the metadata.
+  jq --exit-status '[.children[] | select(.description == "Restoring replicated instance") | .metadata.entity_url] | (length == 3 and all(test("^/1.0/instances/c\\d\\?project=replicator-project$")))' <<< "${bulk_op}"
+  # The finalization stage references the replicator URL in its metadata
+  jq --exit-status '[.children[] | select(.description == "Finalizing replicator") | .metadata.entity_url] | (length == 1 and .[0] == "/1.0/replicators/my-replicator?project=replicator-project")' <<< "${bulk_op}"
   # c1 and c2 are restored from LXD_TWO's current state; c3 (created on LXD_TWO during failover) is created from scratch.
   LXD_DIR="${LXD_ONE_DIR}" lxc list --project replicator-project -f csv -c ns | grep -xF 'c1,STOPPED'
   LXD_DIR="${LXD_ONE_DIR}" lxc list --project replicator-project -f csv -c ns | grep -xF 'c2,STOPPED'
@@ -6177,7 +6278,7 @@ test_clustering_replicator_dr() {
   LXD_DIR="${LXD_ONE_DIR}" lxc project promote-replica replicator-project
   LXD_DIR="${LXD_ONE_DIR}" lxc replicator run my-replicator --project replicator-project
   bulk_op="$(LXD_DIR="${LXD_ONE_DIR}" lxc query -X GET '/1.0/operations?project=replicator-project&recursion=2' | jq --exit-status '[.. | objects | select(.description == "Running replicator")] | max_by(.created_at)')"
-  jq --exit-status '([., (.children? // [])[]] | length) == 4 and .status == "Success" and ((.children // []) | length) == 3 and (all(.children[]; .status == "Success"))' <<< "${bulk_op}"
+  jq --exit-status '([., (.children? // [])[]] | length) == 8 and .status == "Success" and .child_count == 7 and (all(.children[]; .status == "Success"))' <<< "${bulk_op}"
   LXD_DIR="${LXD_TWO_DIR}" lxc list --project replicator-project -f csv -c ns | grep -xF 'c1,STOPPED'
   LXD_DIR="${LXD_TWO_DIR}" lxc list --project replicator-project -f csv -c ns | grep -xF 'c2,STOPPED'
   LXD_DIR="${LXD_TWO_DIR}" lxc list --project replicator-project -f csv -c ns | grep -xF 'c3,STOPPED'
@@ -6218,7 +6319,7 @@ test_clustering_replicator_snapshot() {
 
   # Configure replica project settings: standby sets replica.cluster, leader creates replicator.
   LXD_DIR="${LXD_TWO_DIR}" lxc project set replicator-project replica.cluster=lxd_one
-  LXD_DIR="${LXD_ONE_DIR}" lxc replicator create snap-replicator cluster=lxd_two snapshot=true --project replicator-project
+  LXD_DIR="${LXD_ONE_DIR}" lxc replicator create snap-replicator cluster=lxd_two --project replicator-project
   LXD_DIR="${LXD_TWO_DIR}" lxc project demote-replica replicator-project
   LXD_DIR="${LXD_ONE_DIR}" lxc project promote-replica replicator-project
 
@@ -6231,7 +6332,7 @@ test_clustering_replicator_snapshot() {
 
   LXD_DIR="${LXD_ONE_DIR}" ensure_import_testimage replicator-project
 
-  sub_test "Verify snapshot=true creates a snapshot when instance has no snapshot schedule"
+  sub_test "Verify snapshotting creates a snapshot when instance has no snapshot schedule"
 
   LXD_DIR="${LXD_ONE_DIR}" lxc launch testimage c1 --project replicator-project -d "${SMALL_ROOT_DISK}"
 
@@ -6243,7 +6344,7 @@ test_clustering_replicator_snapshot() {
   # Instance and snapshot must also have been replicated to LXD_TWO.
   LXD_DIR="${LXD_TWO_DIR}" lxc list --project replicator-project -f csv -c nsS | grep -xF 'c1,STOPPED,1'
 
-  sub_test "Verify snapshot=true skips snapshot creation when instance has a snapshot schedule"
+  sub_test "Verify snapshotting is skipped when instance has a snapshot schedule"
 
   LXD_DIR="${LXD_ONE_DIR}" lxc config set c1 snapshots.schedule="@daily" --project replicator-project
 
@@ -6331,35 +6432,35 @@ test_clustering_replicator_multi_member() {
 
   # The replicator operation must report success with two child operations.
   bulk_op="$(LXD_DIR="${LXD_ONE_DIR}" lxc query -X GET '/1.0/operations?project=replicator-project&recursion=2' | jq --exit-status '[.. | objects | select(.description == "Running replicator")] | max_by(.created_at)')"
-  jq --exit-status '([., (.children? // [])[]] | length) == 3 and .status == "Success" and ((.children // []) | length) == 2 and (all(.children[]; .status == "Success"))' <<< "${bulk_op}"
+  jq --exit-status '([., (.children? // [])[]] | length) == 6 and .status == "Success" and .child_count == 5 and (all(.children[]; .status == "Success"))' <<< "${bulk_op}"
 
-  sub_test "Verify snapshot=true works for instances on other cluster members"
+  sub_test "Verify snapshotting works for instances on other cluster members"
 
   LXD_DIR="${LXD_THREE_DIR}" lxc delete c1 c2 --project replicator-project
-  LXD_DIR="${LXD_ONE_DIR}" lxc replicator set my-replicator snapshot=true --project replicator-project
   LXD_DIR="${LXD_ONE_DIR}" lxc replicator run my-replicator --project replicator-project
 
-  # Snapshots must have been created on both source instances.
-  LXD_DIR="${LXD_ONE_DIR}" lxc query "/1.0/instances/c1/snapshots?project=replicator-project" | jq --exit-status 'length == 1'
-  LXD_DIR="${LXD_ONE_DIR}" lxc query "/1.0/instances/c2/snapshots?project=replicator-project" | jq --exit-status 'length == 1'
+  # Snapshots must have been created on both source instances (the first run already took one,
+  # so each instance now has two snapshots total).
+  LXD_DIR="${LXD_ONE_DIR}" lxc query "/1.0/instances/c1/snapshots?project=replicator-project" | jq --exit-status 'length == 2'
+  LXD_DIR="${LXD_ONE_DIR}" lxc query "/1.0/instances/c2/snapshots?project=replicator-project" | jq --exit-status 'length == 2'
 
   # Both instances and their snapshots must be on the target.
-  LXD_DIR="${LXD_THREE_DIR}" lxc list --project replicator-project -f csv -c nsS | grep -xF 'c1,STOPPED,1'
-  LXD_DIR="${LXD_THREE_DIR}" lxc list --project replicator-project -f csv -c nsS | grep -xF 'c2,STOPPED,1'
+  LXD_DIR="${LXD_THREE_DIR}" lxc list --project replicator-project -f csv -c nsS | grep -xF 'c1,STOPPED,2'
+  LXD_DIR="${LXD_THREE_DIR}" lxc list --project replicator-project -f csv -c nsS | grep -xF 'c2,STOPPED,2'
 
   sub_test "Verify idempotent run with instances on other cluster members"
 
   LXD_DIR="${LXD_ONE_DIR}" lxc replicator run my-replicator --project replicator-project
   bulk_op="$(LXD_DIR="${LXD_ONE_DIR}" lxc query -X GET '/1.0/operations?project=replicator-project&recursion=2' | jq --exit-status '[.. | objects | select(.description == "Running replicator")] | max_by(.created_at)')"
-  jq --exit-status '([., (.children? // [])[]] | length) == 3 and .status == "Success" and ((.children // []) | length) == 2 and (all(.children[]; .status == "Success"))' <<< "${bulk_op}"
+  jq --exit-status '([., (.children? // [])[]] | length) == 6 and .status == "Success" and .child_count == 5 and (all(.children[]; .status == "Success"))' <<< "${bulk_op}"
 
-  # Snapshot count must have incremented on both source instances after the second snapshot=true run.
-  LXD_DIR="${LXD_ONE_DIR}" lxc query "/1.0/instances/c1/snapshots?project=replicator-project" | jq --exit-status 'length == 2'
-  LXD_DIR="${LXD_ONE_DIR}" lxc query "/1.0/instances/c2/snapshots?project=replicator-project" | jq --exit-status 'length == 2'
+  # Snapshot count must have incremented on both source instances after the third run.
+  LXD_DIR="${LXD_ONE_DIR}" lxc query "/1.0/instances/c1/snapshots?project=replicator-project" | jq --exit-status 'length == 3'
+  LXD_DIR="${LXD_ONE_DIR}" lxc query "/1.0/instances/c2/snapshots?project=replicator-project" | jq --exit-status 'length == 3'
 
   # Target must also reflect the new snapshots.
-  LXD_DIR="${LXD_THREE_DIR}" lxc list --project replicator-project -f csv -c nsS | grep -xF 'c1,STOPPED,2'
-  LXD_DIR="${LXD_THREE_DIR}" lxc list --project replicator-project -f csv -c nsS | grep -xF 'c2,STOPPED,2'
+  LXD_DIR="${LXD_THREE_DIR}" lxc list --project replicator-project -f csv -c nsS | grep -xF 'c1,STOPPED,3'
+  LXD_DIR="${LXD_THREE_DIR}" lxc list --project replicator-project -f csv -c nsS | grep -xF 'c2,STOPPED,3'
 
   sub_test "Verify --restore rejects running instances on other members"
 
@@ -6383,11 +6484,11 @@ test_clustering_replicator_multi_member() {
 
   # Restore operation must succeed with both instances.
   bulk_op="$(LXD_DIR="${LXD_ONE_DIR}" lxc query -X GET '/1.0/operations?project=replicator-project&recursion=2' | jq --exit-status '[.. | objects | select(.description == "Running replicator")] | max_by(.created_at)')"
-  jq --exit-status '.status == "Success" and ((.children // []) | length) == 2 and (all(.children[]; .status == "Success"))' <<< "${bulk_op}"
+  jq --exit-status '.status == "Success" and .child_count == 3 and (all(.children[]; .status == "Success"))' <<< "${bulk_op}"
 
   # Both instances must be present on the source cluster with their snapshots.
-  LXD_DIR="${LXD_ONE_DIR}" lxc list --project replicator-project -f csv -c nsS | grep -xF 'c1,STOPPED,2'
-  LXD_DIR="${LXD_ONE_DIR}" lxc list --project replicator-project -f csv -c nsS | grep -xF 'c2,STOPPED,2'
+  LXD_DIR="${LXD_ONE_DIR}" lxc list --project replicator-project -f csv -c nsS | grep -xF 'c1,STOPPED,3'
+  LXD_DIR="${LXD_ONE_DIR}" lxc list --project replicator-project -f csv -c nsS | grep -xF 'c2,STOPPED,3'
 
   # Verify instances were restored to their original cluster members.
   LXD_DIR="${LXD_ONE_DIR}" lxc list --project replicator-project -f csv -c nL | grep -xF 'c1,node1'
@@ -6487,7 +6588,7 @@ test_clustering_replicator_evacuated_member() {
 
   # Replicator operation must succeed with two child operations.
   bulk_op="$(LXD_DIR="${LXD_ONE_DIR}" lxc query -X GET '/1.0/operations?project=replicator-project&recursion=2' | jq --exit-status '[.. | objects | select(.description == "Running replicator")] | max_by(.created_at)')"
-  jq --exit-status '.status == "Success" and ((.children // []) | length) == 2 and (all(.children[]; .status == "Success"))' <<< "${bulk_op}"
+  jq --exit-status '.status == "Success" and .child_count == 5 and (all(.children[]; .status == "Success"))' <<< "${bulk_op}"
 
   sub_test "Restore with evacuated member"
 
@@ -6611,20 +6712,19 @@ test_clustering_replicator_vm() {
   # Run replicator.
   LXD_DIR="${LXD_ONE_DIR}" lxc replicator run vm-replicator --project replicator-project
 
-  # VM must appear on the target cluster.
-  LXD_DIR="${LXD_TWO_DIR}" lxc list --project replicator-project -f csv -c ntS | grep -xF 'v1,VIRTUAL-MACHINE,0'
+  # VM must appear on the target cluster with its snapshot (the first run snapshots unconditionally).
+  LXD_DIR="${LXD_TWO_DIR}" lxc list --project replicator-project -f csv -c ntS | grep -xF 'v1,VIRTUAL-MACHINE,1'
 
-  sub_test "Verify VM replication with snapshot=true"
+  sub_test "Verify VM replication creates a snapshot"
 
   LXD_DIR="${LXD_TWO_DIR}" lxc delete v1 --project replicator-project
-  LXD_DIR="${LXD_ONE_DIR}" lxc replicator set vm-replicator snapshot=true --project replicator-project
   LXD_DIR="${LXD_ONE_DIR}" lxc replicator run vm-replicator --project replicator-project
 
-  # A snapshot must have been created on the source VM.
-  LXD_DIR="${LXD_ONE_DIR}" lxc query "/1.0/instances/v1/snapshots?project=replicator-project" | jq --exit-status 'length == 1'
+  # Source now has two snapshots: one from the first run, one from this run.
+  LXD_DIR="${LXD_ONE_DIR}" lxc query "/1.0/instances/v1/snapshots?project=replicator-project" | jq --exit-status 'length == 2'
 
-  # VM and snapshot must be on the target.
-  LXD_DIR="${LXD_TWO_DIR}" lxc list --project replicator-project -f csv -c ntS | grep -xF 'v1,VIRTUAL-MACHINE,1'
+  # VM and both snapshots must be on the target.
+  LXD_DIR="${LXD_TWO_DIR}" lxc list --project replicator-project -f csv -c ntS | grep -xF 'v1,VIRTUAL-MACHINE,2'
 
   sub_test "Verify idempotent second run for VM replication"
 
@@ -6634,13 +6734,13 @@ test_clustering_replicator_vm() {
 
   # Operation must succeed.
   bulk_op="$(LXD_DIR="${LXD_ONE_DIR}" lxc query -X GET '/1.0/operations?project=replicator-project&recursion=2' | jq --exit-status '[.. | objects | select(.description == "Running replicator")] | max_by(.created_at)')"
-  jq --exit-status '.status == "Success" and ((.children // []) | length) == 1 and (all(.children[]; .status == "Success"))' <<< "${bulk_op}"
+  jq --exit-status '.status == "Success" and .child_count == 3 and (all(.children[]; .status == "Success"))' <<< "${bulk_op}"
 
-  # snapshot=true creates a second snapshot, so source now has 2.
-  LXD_DIR="${LXD_ONE_DIR}" lxc query "/1.0/instances/v1/snapshots?project=replicator-project" | jq --exit-status 'length == 2'
+  # Each run adds a snapshot; source now has three.
+  LXD_DIR="${LXD_ONE_DIR}" lxc query "/1.0/instances/v1/snapshots?project=replicator-project" | jq --exit-status 'length == 3'
 
-  # VM must still exist with both snapshots on the target.
-  LXD_DIR="${LXD_TWO_DIR}" lxc list --project replicator-project -f csv -c ntS | grep -xF 'v1,VIRTUAL-MACHINE,2'
+  # VM must still exist with all three snapshots on the target.
+  LXD_DIR="${LXD_TWO_DIR}" lxc list --project replicator-project -f csv -c ntS | grep -xF 'v1,VIRTUAL-MACHINE,3'
 
   # Cleanup
   LXD_DIR="${LXD_TWO_DIR}" lxc delete v1 --project replicator-project
@@ -6725,7 +6825,7 @@ test_clustering_replicator_unclustered() {
   LXD_DIR="${LXD_ONE_DIR}" lxc init --empty c2 --project replicator-project -d "${SMALL_ROOT_DISK}"
   LXD_DIR="${LXD_ONE_DIR}" lxc replicator run my-replicator --project replicator-project
   bulk_op="$(LXD_DIR="${LXD_ONE_DIR}" lxc query -X GET '/1.0/operations?project=replicator-project&recursion=2' | jq --exit-status '[.. | objects | select(.description == "Running replicator")] | max_by(.created_at)')"
-  jq --exit-status '([., (.children? // [])[]] | length) == 3 and .status == "Success" and ((.children // []) | length) == 2 and (all(.children[]; .status == "Success"))' <<< "${bulk_op}"
+  jq --exit-status '([., (.children? // [])[]] | length) == 6 and .status == "Success" and .child_count == 5 and (all(.children[]; .status == "Success"))' <<< "${bulk_op}"
   LXD_DIR="${LXD_TWO_DIR}" lxc list --project replicator-project -f csv -c ns | grep -xF 'c1,STOPPED'
   LXD_DIR="${LXD_TWO_DIR}" lxc list --project replicator-project -f csv -c ns | grep -xF 'c2,STOPPED'
 
@@ -6786,7 +6886,7 @@ test_clustering_replicator_unclustered() {
   # must fall back to core.https_address rather than the sentinel address.
   LXD_DIR="${LXD_ONE_DIR}" lxc replicator run my-replicator --restore --project replicator-project
   bulk_op="$(LXD_DIR="${LXD_ONE_DIR}" lxc query -X GET '/1.0/operations?project=replicator-project&recursion=2' | jq --exit-status '[.. | objects | select(.description == "Running replicator")] | max_by(.created_at)')"
-  jq --exit-status '([., (.children? // [])[]] | length) == 4 and .status == "Success" and ((.children // []) | length) == 3 and (all(.children[]; .status == "Success"))' <<< "${bulk_op}"
+  jq --exit-status '([., (.children? // [])[]] | length) == 5 and .status == "Success" and .child_count == 4 and (all(.children[]; .status == "Success"))' <<< "${bulk_op}"
   # c1 and c2 are restored from LXD_TWO; c3 was created during failover and is also restored.
   LXD_DIR="${LXD_ONE_DIR}" lxc list --project replicator-project -f csv -c ns | grep -xF 'c1,STOPPED'
   LXD_DIR="${LXD_ONE_DIR}" lxc list --project replicator-project -f csv -c ns | grep -xF 'c2,STOPPED'
@@ -6817,6 +6917,9 @@ test_clustering_link_unidirectional() {
   spawn_lxd_and_join_cluster "${cert}" 4 3 "${LXD_THREE_DIR}"
 
   sub_test "Check CLI validation for unidirectional flags"
+
+  # --unidirectional and --public are mutually exclusive.
+  [ "$(CLIENT_DEBUG="" SHELL_TRACING="" LXD_DIR="${LXD_ONE_DIR}" lxc cluster link create foo --unidirectional --public --remote-address 1.2.3.4:8443 2>&1)" = 'Error: if any flags in the group [unidirectional public] are set none of the others can be; [public unidirectional] were all set' ]
 
   # --unidirectional without --token must fail.
   [ "$(CLIENT_DEBUG="" SHELL_TRACING="" LXD_DIR="${LXD_ONE_DIR}" lxc cluster link create foo --unidirectional 2>&1)" = 'Error: --unidirectional requires --token' ]
@@ -6897,4 +7000,548 @@ test_clustering_link_unidirectional() {
   kill_lxd "${LXD_THREE_DIR}"
   kill_lxd "${LXD_TWO_DIR}"
   kill_lxd "${LXD_ONE_DIR}"
+}
+
+test_clustering_link_public() {
+  # A syntactically valid fingerprint that never matches a real certificate.
+  wrong_fingerprint="$(printf 'a%.0s' $(seq 64))"
+
+  # Cluster A = LXD_ONE + LXD_TWO, Cluster B = LXD_THREE + LXD_FOUR.
+  # Public links are created on A alone; B is never contacted beyond the initial certificate fetch.
+
+  # Create first 2-node cluster (node1, node2).
+  spawn_lxd_and_bootstrap_cluster
+
+  local cert
+  cert="$(cert_to_yaml "${LXD_ONE_DIR}/cluster.crt")"
+  spawn_lxd_and_join_cluster "${cert}" 2 1 "${LXD_ONE_DIR}"
+
+  # Create second 2-node cluster (node3, node4).
+  spawn_lxd_and_bootstrap_cluster "dir" "" 3
+
+  cert="$(cert_to_yaml "${LXD_THREE_DIR}/cluster.crt")"
+  spawn_lxd_and_join_cluster "${cert}" 4 3 "${LXD_THREE_DIR}"
+
+  LXD_B_ADDR="$(LXD_DIR="${LXD_THREE_DIR}" lxc config get core.https_address)"
+  # Same address without the port, for the canonicalization check below.
+  LXD_B_HOST="${LXD_B_ADDR%:*}"
+
+  sub_test "Check CLI validation for public flags"
+
+  # --public requires --remote-address, and vice versa. Both directions are enforced by cobra.
+  [ "$(CLIENT_DEBUG="" SHELL_TRACING="" LXD_DIR="${LXD_ONE_DIR}" lxc cluster link create foo --public 2>&1)" = 'Error: if any flags in the group [public remote-address] are set they must all be set; missing [remote-address]' ]
+  [ "$(CLIENT_DEBUG="" SHELL_TRACING="" LXD_DIR="${LXD_ONE_DIR}" lxc cluster link create foo --remote-address "${LXD_B_ADDR}" 2>&1)" = 'Error: if any flags in the group [public remote-address] are set they must all be set; missing [public]' ]
+
+  # Public links create no identity, so auth groups are meaningless for them.
+  [ "$(CLIENT_DEBUG="" SHELL_TRACING="" LXD_DIR="${LXD_ONE_DIR}" lxc cluster link create foo --public --remote-address "${LXD_B_ADDR}" --auth-group mygroup 2>&1)" = 'Error: if any flags in the group [public auth-group] are set none of the others can be; [auth-group public] were all set' ]
+
+  # Public links use no token; accepting one would silently ignore it.
+  [ "$(CLIENT_DEBUG="" SHELL_TRACING="" LXD_DIR="${LXD_ONE_DIR}" lxc cluster link create foo --public --remote-address "${LXD_B_ADDR}" --token fake 2>&1)" = 'Error: if any flags in the group [public token] are set none of the others can be; [public token] were all set' ]
+
+  sub_test "Check pending creation rejected for public type without remote_address"
+
+  # Directly calling the API with type=public and a name but no
+  # remote_address must be rejected.
+  [ "$(CLIENT_DEBUG="" SHELL_TRACING="" LXD_DIR="${LXD_ONE_DIR}" lxc query --request POST /1.0/cluster/links --data '{"name":"bad-link","type":"public"}' 2>&1)" = 'Error: Public cluster links require remote_address' ]
+
+  # Ensure no link was created.
+  if LXD_DIR="${LXD_ONE_DIR}" lxc cluster link list --format csv | grep -wF 'bad-link'; then
+    echo "ERROR: cluster link 'bad-link' unexpectedly created for pending public request" >&2
+    exit 1
+  fi
+
+  sub_test "Check confirming a public link with no matching pending link is rejected"
+
+  # The fingerprint is compared against the pending link's own certificate, so its value is
+  # irrelevant here: no link named "no-such-link" exists to look up.
+  [ "$(CLIENT_DEBUG="" SHELL_TRACING="" LXD_DIR="${LXD_ONE_DIR}" lxc query --request POST /1.0/cluster/links --data "{\"name\":\"no-such-link\",\"type\":\"public\",\"fingerprint\":\"${wrong_fingerprint}\"}" 2>&1)" = 'Error: Failed loading pending cluster link "no-such-link": Failed loading cluster link: Cluster link not found' ]
+
+  sub_test "Check public link: certificate rejection"
+
+  # Responding 'n' to the fingerprint prompt must abort link creation.
+  # Use 2>&1 >/dev/null to capture only stderr (the error message), discarding the interactive prompt on stdout.
+  [ "$(printf 'n\n' | CLIENT_DEBUG="" SHELL_TRACING="" LXD_DIR="${LXD_ONE_DIR}" lxc cluster link create lxd_b --public --remote-address "${LXD_B_ADDR}" 2>&1 >/dev/null)" = 'Error: Remote cluster certificate NACKed by user' ]
+  if LXD_DIR="${LXD_ONE_DIR}" lxc cluster link list --format csv | grep -wF 'lxd_b'; then
+    echo "ERROR: cluster link 'lxd_b' unexpectedly found on A after certificate rejection" >&2
+    exit 1
+  fi
+
+  # A wrong fingerprint of the right length must fail immediately rather than re-prompting, so
+  # scripts feeding a stale fingerprint cannot hang.
+  [ "$(printf '%s\n' "${wrong_fingerprint}" | CLIENT_DEBUG="" SHELL_TRACING="" LXD_DIR="${LXD_ONE_DIR}" lxc cluster link create lxd_b --public --remote-address "${LXD_B_ADDR}" 2>&1 >/dev/null)" = 'Error: The provided fingerprint does not match the remote cluster certificate fingerprint' ]
+  if LXD_DIR="${LXD_ONE_DIR}" lxc cluster link list --format csv | grep -wF 'lxd_b'; then
+    echo "ERROR: cluster link 'lxd_b' unexpectedly found on A after fingerprint mismatch" >&2
+    exit 1
+  fi
+
+  # Losing stdin entirely must also clean up the pending link rather than orphaning it.
+  ! LXD_DIR="${LXD_ONE_DIR}" lxc cluster link create lxd_b --public --remote-address "${LXD_B_ADDR}" < /dev/null || false
+  if LXD_DIR="${LXD_ONE_DIR}" lxc cluster link list --format csv | grep -wF 'lxd_b'; then
+    echo "ERROR: cluster link 'lxd_b' unexpectedly left pending on A after stdin EOF" >&2
+    exit 1
+  fi
+
+  sub_test "Check caller-supplied volatile keys are ignored when creating a pending link"
+
+  # A caller-set volatile.addresses would otherwise make the pending link look already confirmed,
+  # leaving it impossible to confirm and only deletable.
+  pending="$(LXD_DIR="${LXD_ONE_DIR}" lxc query --request POST /1.0/cluster/links --data "{\"name\":\"volatile_link\",\"type\":\"public\",\"remote_address\":\"${LXD_B_ADDR}\",\"config\":{\"volatile.addresses\":\"1.2.3.4:8443\"}}")"
+  [ "$(LXD_DIR="${LXD_ONE_DIR}" lxc cluster link get volatile_link volatile.addresses || echo fail)" = "" ]
+
+  # The link is still confirmable, proving the injected key did not brick it. Feed back the
+  # fingerprint the server actually returned rather than assuming which certificate the remote
+  # presents.
+  fingerprint="$(echo "${pending}" | jq --exit-status --raw-output '.fingerprint')"
+  LXD_DIR="${LXD_ONE_DIR}" lxc query --request POST /1.0/cluster/links --data "{\"name\":\"volatile_link\",\"type\":\"public\",\"fingerprint\":\"${fingerprint}\"}" > /dev/null
+  [ "$(LXD_DIR="${LXD_ONE_DIR}" lxc cluster link get volatile_link volatile.addresses)" = "${LXD_B_ADDR}" ]
+  LXD_DIR="${LXD_ONE_DIR}" lxc cluster link delete volatile_link
+
+  sub_test "Check re-running the pending phase refreshes an unconfirmed link"
+
+  # A caller interrupted at the confirmation prompt must be able to simply retry rather than
+  # hitting a unique name conflict on a link they cannot see a way to clean up.
+  LXD_DIR="${LXD_ONE_DIR}" lxc query --request POST /1.0/cluster/links --data "{\"name\":\"retry_link\",\"type\":\"public\",\"remote_address\":\"${LXD_B_ADDR}\"}" > /dev/null
+  LXD_DIR="${LXD_ONE_DIR}" lxc query --request POST /1.0/cluster/links --data "{\"name\":\"retry_link\",\"type\":\"public\",\"remote_address\":\"${LXD_B_ADDR}\"}" > /dev/null
+  LXD_DIR="${LXD_ONE_DIR}" lxc cluster link delete retry_link
+
+  sub_test "Check confirming a public link with a mismatched certificate is rejected"
+
+  # Create a pending public link directly via the API (bypassing the CLI) so we can attempt
+  # confirming with a certificate that does not match what was actually fetched.
+  LXD_DIR="${LXD_ONE_DIR}" lxc query --request POST /1.0/cluster/links --data "{\"name\":\"mismatch_link\",\"type\":\"public\",\"remote_address\":\"${LXD_B_ADDR}\"}" > /dev/null
+
+  # Attempt to confirm with a fingerprint that is not the one returned for this link.
+  [ "$(CLIENT_DEBUG="" SHELL_TRACING="" LXD_DIR="${LXD_ONE_DIR}" lxc query --request POST /1.0/cluster/links --data "{\"name\":\"mismatch_link\",\"type\":\"public\",\"fingerprint\":\"${wrong_fingerprint}\"}" 2>&1)" = 'Error: Certificate fingerprint does not match the fingerprint returned when the pending cluster link was created' ]
+
+  # The link must remain pending: no volatile.addresses set, so it's still inert.
+  [ "$(LXD_DIR="${LXD_ONE_DIR}" lxc cluster link get mismatch_link volatile.addresses || echo fail)" = "" ]
+
+  # Clean up the still-pending link.
+  LXD_DIR="${LXD_ONE_DIR}" lxc cluster link delete mismatch_link
+
+  sub_test "Check confirm rejects a resubmitted remote address and pins the verified one"
+
+  # remote_address belongs to the pending phase only. Confirming always pins the address the
+  # server fetched and verified, so an address sent here must be rejected rather than silently
+  # ignored, which would let a caller believe they chose the address that gets pinned.
+  pending="$(LXD_DIR="${LXD_ONE_DIR}" lxc query --request POST /1.0/cluster/links --data "{\"name\":\"address_link\",\"type\":\"public\",\"remote_address\":\"${LXD_B_ADDR}\"}")"
+  fingerprint="$(echo "${pending}" | jq --exit-status --raw-output '.fingerprint')"
+  [ "$(CLIENT_DEBUG="" SHELL_TRACING="" LXD_DIR="${LXD_ONE_DIR}" lxc query --request POST /1.0/cluster/links --data "{\"name\":\"address_link\",\"type\":\"public\",\"remote_address\":\"192.0.2.1:8443\",\"fingerprint\":\"${fingerprint}\"}" 2>&1)" = 'Error: Remote address cannot be set when confirming a pending public cluster link' ]
+
+  # The rejection must leave the link pending rather than half-confirmed.
+  [ "$(LXD_DIR="${LXD_ONE_DIR}" lxc cluster link get address_link volatile.addresses || echo fail)" = "" ]
+
+  # Confirming without an address succeeds and pins the address verified during the pending phase.
+  LXD_DIR="${LXD_ONE_DIR}" lxc query --request POST /1.0/cluster/links --data "{\"name\":\"address_link\",\"type\":\"public\",\"fingerprint\":\"${fingerprint}\"}" > /dev/null
+  [ "$(LXD_DIR="${LXD_ONE_DIR}" lxc cluster link get address_link volatile.addresses)" = "${LXD_B_ADDR}" ]
+  LXD_DIR="${LXD_ONE_DIR}" lxc cluster link delete address_link
+
+  sub_test "Check a port-less remote address is canonicalized before being pinned"
+
+  # cluster.ConnectCluster does not default the port, so an address pinned without one would
+  # silently connect to :443 and never reach the remote cluster.
+  printf 'y\n' | LXD_DIR="${LXD_ONE_DIR}" lxc cluster link create noport_link --public --remote-address "${LXD_B_HOST}"
+  [ "$(LXD_DIR="${LXD_ONE_DIR}" lxc cluster link get noport_link volatile.addresses)" = "${LXD_B_HOST}:8443" ]
+  LXD_DIR="${LXD_ONE_DIR}" lxc cluster link delete noport_link
+
+  sub_test "Check public link creation"
+
+  # Responding 'y' to the fingerprint prompt creates the link on A only.
+  printf 'y\n' | LXD_DIR="${LXD_ONE_DIR}" lxc cluster link create lxd_b --public --remote-address "${LXD_B_ADDR}"
+
+  LXD_DIR="${LXD_ONE_DIR}" lxc cluster link list --format csv | grep -wF 'lxd_b'
+  LXD_DIR="${LXD_ONE_DIR}" lxc cluster link show lxd_b | grep -xF 'type: public'
+
+  # Both pending keys are cleared once confirmed; only volatile.addresses remains.
+  [ "$(LXD_DIR="${LXD_ONE_DIR}" lxc cluster link get lxd_b volatile.pending_certificate || echo fail)" = "" ]
+  [ "$(LXD_DIR="${LXD_ONE_DIR}" lxc cluster link get lxd_b volatile.pending_address || echo fail)" = "" ]
+  [ "$(LXD_DIR="${LXD_ONE_DIR}" lxc cluster link get lxd_b volatile.addresses)" = "${LXD_B_ADDR}" ]
+
+  # B must have no knowledge of this link. No name is ever sent to B (it is contacted only for the
+  # TLS handshake), so assert its link list is empty rather than probing for a particular name.
+  [ "$(LXD_DIR="${LXD_THREE_DIR}" lxc cluster link list --format csv || echo fail)" = "" ]
+
+  if LXD_DIR="${LXD_THREE_DIR}" lxc auth identity list --format csv | grep -wF 'Cluster link certificate'; then
+    echo "ERROR: cluster link certificate unexpectedly found on B" >&2
+    exit 1
+  fi
+
+  # No identity should exist on A either.
+  if LXD_DIR="${LXD_ONE_DIR}" lxc auth identity list --format csv | grep -wF 'Cluster link certificate'; then
+    echo "ERROR: cluster link certificate unexpectedly found on A" >&2
+    exit 1
+  fi
+
+  sub_test "Check confirming an already-confirmed public link is rejected"
+
+  # lxd_b is already confirmed above; resubmitting a confirm request must fail with a conflict
+  # rather than silently re-pinning a (possibly different) certificate.
+  [ "$(CLIENT_DEBUG="" SHELL_TRACING="" LXD_DIR="${LXD_ONE_DIR}" lxc query --request POST /1.0/cluster/links --data "{\"name\":\"lxd_b\",\"type\":\"public\",\"fingerprint\":\"${wrong_fingerprint}\"}" 2>&1)" = 'Error: Cluster link "lxd_b" has already been confirmed' ]
+
+  # Re-running the pending phase against a confirmed link must conflict too, rather than
+  # resetting it to pending.
+  [ "$(CLIENT_DEBUG="" SHELL_TRACING="" LXD_DIR="${LXD_ONE_DIR}" lxc query --request POST /1.0/cluster/links --data "{\"name\":\"lxd_b\",\"type\":\"public\",\"remote_address\":\"${LXD_B_ADDR}\"}" 2>&1)" = 'Error: Cluster link "lxd_b" has already been confirmed' ]
+
+  sub_test "Check public link: link state reachable"
+
+  # This is a real request over the link: 'cluster link info' dials each member address using the
+  # public connection args. Public links present no client certificate, so the remote sees an
+  # untrusted connection and the expected state is UNAUTHENTICATED (reachable but not trusted),
+  # not ACTIVE.
+  LXD_DIR="${LXD_ONE_DIR}" lxc cluster link info lxd_b | grep -wF 'UNAUTHENTICATED'
+
+  sub_test "Check public links are rejected by replicators and project replication"
+
+  # Public links present no client certificate, so B cannot authenticate the connection.
+  # Replication needs authenticated access and must reject the link up front.
+  LXD_DIR="${LXD_ONE_DIR}" lxc project create replica-public-project
+  [ "$(CLIENT_DEBUG="" SHELL_TRACING="" LXD_DIR="${LXD_ONE_DIR}" lxc replicator create my-replicator cluster=lxd_b --project replica-public-project 2>&1)" = 'Error: Invalid value for replicator configuration key "cluster": Cluster link "lxd_b" is of type "public", which cannot be used for replication' ]
+
+  [ "$(CLIENT_DEBUG="" SHELL_TRACING="" LXD_DIR="${LXD_ONE_DIR}" lxc project set replica-public-project replica.cluster=lxd_b 2>&1)" = 'Error: Invalid project configuration key "replica.cluster" value: Cluster link "lxd_b" is of type "public", which cannot be used for replication' ]
+
+  LXD_DIR="${LXD_ONE_DIR}" lxc project delete replica-public-project
+
+  sub_test "Check public link deletion"
+
+  # Deleting the link on A should succeed without any identity cleanup.
+  LXD_DIR="${LXD_ONE_DIR}" lxc cluster link delete lxd_b
+  if LXD_DIR="${LXD_ONE_DIR}" lxc cluster link list --format csv | grep -wF 'lxd_b'; then
+    echo "ERROR: cluster link 'lxd_b' unexpectedly found on A after deletion" >&2
+    exit 1
+  fi
+
+  # Cleanup.
+  LXD_DIR="${LXD_FOUR_DIR}" lxd shutdown
+  LXD_DIR="${LXD_THREE_DIR}" lxd shutdown
+  LXD_DIR="${LXD_TWO_DIR}" lxd shutdown
+  LXD_DIR="${LXD_ONE_DIR}" lxd shutdown
+
+  rm -f "${LXD_FOUR_DIR}/unix.socket"
+  rm -f "${LXD_THREE_DIR}/unix.socket"
+  rm -f "${LXD_TWO_DIR}/unix.socket"
+  rm -f "${LXD_ONE_DIR}/unix.socket"
+
+  teardown_clustering_netns
+  teardown_clustering_bridge
+
+  kill_lxd "${LXD_FOUR_DIR}"
+  kill_lxd "${LXD_THREE_DIR}"
+  kill_lxd "${LXD_TWO_DIR}"
+  kill_lxd "${LXD_ONE_DIR}"
+}
+
+test_clustering_acme() {
+  echo "==> Setting up clustering ACME test"
+
+  # Set up the clustering bridge (100.64.1.1/16)
+  setup_clustering_bridge
+
+  # Start mini-acme on the bridge IP so it's reachable from all cluster nodes.
+  local ACME_DOMAIN="lxd$$.example.com"
+
+  # Syntax: spawn_acme <validation-addr> <listen-addr>
+  # - Listen on bridge IP (100.64.1.1) accessible from all cluster nodes
+  # - Validate against node1 (100.64.1.101:8443) since it is the leader
+  # - Advertise bridge IP in ACME directory URLs
+  spawn_acme "100.64.1.101:8443" "100.64.1.1"
+
+  local ACME_PORT
+  ACME_PORT="$(< "${TEST_DIR}/acme.port")"
+
+  sub_test "Bootstrap cluster with ACME CA certificate"
+
+  echo "Create cluster with 3 nodes."
+  LEGO_CA_CERTIFICATES="${TEST_DIR}/mini-acme-ca.crt" spawn_lxd_and_bootstrap_cluster
+
+  local cert
+  cert="$(cert_to_yaml "${LXD_ONE_DIR}/cluster.crt")"
+
+  # Spawn a second node
+  LEGO_CA_CERTIFICATES="${TEST_DIR}/mini-acme-ca.crt" spawn_lxd_and_join_cluster "${cert}" 2 1 "${LXD_ONE_DIR}"
+
+  # Spawn a third node
+  LEGO_CA_CERTIFICATES="${TEST_DIR}/mini-acme-ca.crt" spawn_lxd_and_join_cluster "${cert}" 3 1 "${LXD_ONE_DIR}"
+
+  sub_test "Configure ACME on cluster node"
+
+  # Configure ACME to use mini-acme server. Use LXD_TWO (leader is LXD_ONE) to update the config so that we test config
+  # forwarding and updating of certificates across the cluster.
+  LXD_DIR="${LXD_TWO_DIR}" lxc config set \
+    acme.agree_tos=true \
+    acme.ca_url="https://100.64.1.1:${ACME_PORT}/directory" \
+    acme.domain="${ACME_DOMAIN}" \
+    acme.email="coyote@acme.example.com"
+
+  sub_test "Verify ACME certificate is served"
+
+  # Verify all members are using the ACME certificate
+  for i in $(seq 3); do
+    success=0
+    for _ in $(seq 10); do
+      # Use --resolve to map domain to the cluster node IP.
+      if curl -s --cacert "${TEST_DIR}/mini-acme-ca.crt" --resolve "${ACME_DOMAIN}:8443:100.64.1.10${i}" -o /dev/null "https://${ACME_DOMAIN}:8443/"; then
+        success=1
+        break
+      fi
+
+      sleep 0.3
+    done
+
+    if [ "${success}" = 0 ]; then
+      echo "Failed verifying ACME certificate on member ${i}"
+      false
+    fi
+  done
+
+  # Cleanup
+  echo "==> Cleaning up clustering ACME test"
+
+  LXD_DIR="${LXD_THREE_DIR}" lxd shutdown
+  LXD_DIR="${LXD_TWO_DIR}" lxd shutdown
+  LXD_DIR="${LXD_ONE_DIR}" lxd shutdown
+
+  rm -f "${LXD_THREE_DIR}/unix.socket"
+  rm -f "${LXD_TWO_DIR}/unix.socket"
+  rm -f "${LXD_ONE_DIR}/unix.socket"
+
+  teardown_clustering_netns
+  teardown_clustering_bridge
+
+  kill_lxd "${LXD_THREE_DIR}"
+  kill_lxd "${LXD_TWO_DIR}"
+  kill_lxd "${LXD_ONE_DIR}"
+
+  kill_acme
+}
+
+test_clustering_durable_operations() {
+  spawn_lxd_and_bootstrap_cluster
+  echo "Launched member 1"
+
+  local cert
+  cert="$(cert_to_yaml "${LXD_ONE_DIR}/cluster.crt")"
+
+  # Spawn a second node
+  spawn_lxd_and_join_cluster "${cert}" 2 1 "${LXD_ONE_DIR}"
+
+  echo "Launched member 2"
+
+  # Spawn a third node
+  spawn_lxd_and_join_cluster "${cert}" 3 1 "${LXD_ONE_DIR}"
+
+  echo "Launched member 3"
+
+  # Spawn a fourth node, this will be a non-voter, stand-by node.
+  spawn_lxd_and_join_cluster "${cert}" 4 1 "${LXD_ONE_DIR}"
+
+  echo "Launched member 4"
+
+  LXD_DIR="${LXD_TWO_DIR}" lxc cluster list
+  [ "$(LXD_DIR="${LXD_TWO_DIR}" lxc cluster list | grep -wFc "database-standby")" = "1" ]
+
+  # Set the offline threshold to the minimum allowed value
+  LXD_DIR="${LXD_ONE_DIR}" lxc config set cluster.offline_threshold=11
+
+  sub_test "Durable operation moves to leader when member is killed"
+
+  # Spawn a durable operation on node 2 and sleep to ensure it starts.
+  # At the moment we know that node1 is the leader because it is the member that was bootstrapped.
+  operation_id="$(LXD_DIR="${LXD_TWO_DIR}" lxd_durable_wait_operation "12s")"
+  sleep 1
+
+  # Kill the second node.
+  kill_go_proc "$(< "${LXD_TWO_DIR}/lxd.pid")"
+  echo "Stopped member 2"
+
+  # Wait for the operation to succeed. In this time it will have moved to the leader.
+  succeeded=0
+  for i in $(seq 60); do
+    if LXD_DIR="${LXD_ONE_DIR}" lxc query "/1.0/operations/${operation_id}" | jq --exit-status '.status == "Success" and .location == "node1"'; then
+      succeeded=1
+      break
+    fi
+
+    sleep 1
+  done
+
+  if [ "${succeeded}" = 0 ]; then
+    echo "Durable operation did not move to the leader"
+    false
+  fi
+
+  # Respawn the second node.
+  echo "Respawning cluster member 2..."
+  respawn_lxd_cluster_member "${ns2}" "${LXD_TWO_DIR}"
+
+  echo "Started member 2"
+
+  # Wait for node2 to be detected as back online.
+  for _ in $(seq 20); do
+    if [ "$(LXD_DIR="${LXD_TWO_DIR}" lxc query /1.0/cluster/members/node2 | jq --exit-status -r '.status')" = 'Online' ]; then
+      break
+    fi
+
+    sleep 1
+  done
+
+  echo "Member 2 is online"
+
+  sub_test "Durable operation restarts on new leader when current leader is killed"
+
+  # Spawn a durable operation on the leader and sleep to ensure it starts
+  operation_id="$(LXD_DIR="${LXD_ONE_DIR}" lxd_durable_wait_operation "12s")"
+  sleep 1
+
+  # Shutdown the leader.
+  kill_go_proc "$(< "${LXD_ONE_DIR}/lxd.pid")"
+  echo "Stopped leader (member 1)"
+
+  # Wait for the operation to succeed. In this time leader election should occur and the operation should restart on the new leader.
+  succeeded=0
+  for i in $(seq 60); do
+    leader="$(lxd_leader_name "${LXD_TWO_DIR}")"
+    if LXD_DIR="${LXD_TWO_DIR}" lxc query "/1.0/operations/${operation_id}" | jq --exit-status '.status == "Success" and .location == "'"${leader}"'"'; then
+      succeeded=1
+      break
+    fi
+
+    sleep 1
+  done
+
+  if [ "${succeeded}" = 0 ]; then
+    echo "Durable operation was not restarted on the newly elected leader"
+    false
+  fi
+
+  echo "Respawning member 1"
+  respawn_lxd_cluster_member "${ns1}" "${LXD_ONE_DIR}"
+  echo "Started member 1"
+
+  # Wait for previous leader to be detected as back online.
+  for _ in $(seq 20); do
+    if [ "$(LXD_DIR="${LXD_TWO_DIR}" lxc query /1.0/cluster/members/node1 | jq --exit-status -r '.status')" = 'Online' ]; then
+      break
+    fi
+
+    sleep 1
+  done
+
+  echo "Member 1 is now online"
+
+  sub_test "Durable operation moves to leader when non-leader member is network partitioned"
+
+  # Spawn a durable operation on a non-leader node.
+  # We know that node1 is not the leader because it has just respawned and rejoined.
+  operation_id="$(LXD_DIR="${LXD_ONE_DIR}" lxd_durable_wait_operation "12s")"
+  sleep 1
+
+  # Partition the node from the network by blocking traffic on port 8443 (cluster HTTPS port)
+  echo "Partitioning node1 from network"
+  ip netns exec "${ns1}" iptables -A INPUT -p tcp --dport 8443 -j DROP
+  ip netns exec "${ns1}" iptables -A OUTPUT -p tcp --sport 8443 -j DROP
+
+  # Wait for the operation to succeed on the leader
+  succeeded=0
+  for i in $(seq 60); do
+    leader="$(lxd_leader_name "${LXD_ONE_DIR}")"
+    # Query from a non-partitioned node
+    if LXD_DIR="${LXD_ONE_DIR}" lxc query "/1.0/operations/${operation_id}" | jq --exit-status '.status == "Success" and .location == "'"${leader}"'"'; then
+      succeeded=1
+      break
+    fi
+
+    sleep 1
+  done
+
+  if [ "${succeeded}" = 0 ]; then
+    echo "Durable operation did not move to the leader after network partition"
+    # Clean up partition before failing
+    ip netns exec "${ns1}" iptables -F || true
+    false
+  fi
+
+  # Verify the operation was cancelled on the partitioned node by checking it's not in the local operations list
+  # Note: We cannot query the partitioned node's API due to the partition, so we'll verify after removing partition
+
+  # Remove the network partition
+  echo "Removing network partition"
+  ip netns exec "${ns1}" iptables -F
+
+  # Wait for partitioned member to be detected as back online.
+  for _ in $(seq 20); do
+    if [ "$(LXD_DIR="${LXD_TWO_DIR}" lxc query /1.0/cluster/members/node1 | jq --exit-status -r '.status')" = 'Online' ]; then
+      break
+    fi
+
+    sleep 1
+  done
+
+  sub_test "Durable operation restarts on new leader when current leader is partitioned from the network"
+
+  # Spawn a durable operation on the current leader.
+  # We don't know who the leader is, so find it first.
+  leader_name="$(lxd_leader_name "${LXD_ONE_DIR}")"
+  leader_dir="$(lxd_dir_from_name "${leader_name}")"
+  leader_ns="${bridge}${leader_name#node}"
+  operation_id="$(LXD_DIR="${leader_dir}" lxd_durable_wait_operation "12s")"
+  sleep 1
+
+  # Partition the node from the network by blocking traffic on port 8443 (cluster HTTPS port)
+  echo "Partitioning ${leader_name} from network"
+  ip netns exec "${leader_ns}" iptables -A INPUT -p tcp --dport 8443 -j DROP
+  ip netns exec "${leader_ns}" iptables -A OUTPUT -p tcp --sport 8443 -j DROP
+
+  # Wait for the operation to succeed on the leader
+  succeeded=0
+  for i in $(seq 60); do
+    leader="$(lxd_leader_name "${LXD_ONE_DIR}")"
+    # Query from a non-partitioned node
+    if LXD_DIR="${LXD_ONE_DIR}" lxc query "/1.0/operations/${operation_id}" | jq --exit-status '.status == "Success" and .location == "'"${leader}"'"'; then
+      succeeded=1
+      break
+    fi
+
+    sleep 1
+  done
+
+  if [ "${succeeded}" = 0 ]; then
+    echo "Durable operation did not move to the new leader after the previous leader was partitioned from the network"
+    # Clean up partition before failing
+    ip netns exec "${leader_ns}" iptables -F || true
+    false
+  fi
+
+  # Verify the operation was cancelled on the partitioned node by checking it's not in the local operations list
+  # Note: We cannot query the partitioned node's API due to the partition, so we'll verify after removing partition
+
+  # Remove the network partition
+  echo "Removing network partition"
+  ip netns exec "${leader_ns}" iptables -F
+
+  # Wait for partitioned member to be detected as back online.
+  for _ in $(seq 20); do
+    if [ "$(LXD_DIR="${LXD_ONE_DIR}" lxc query "/1.0/cluster/members/${leader_name}" | jq --exit-status -r '.status')" = 'Online' ]; then
+      break
+    fi
+
+    sleep 1
+  done
+
+  LXD_DIR="${LXD_ONE_DIR}" lxd shutdown
+  LXD_DIR="${LXD_TWO_DIR}" lxd shutdown
+  LXD_DIR="${LXD_THREE_DIR}" lxd shutdown
+  LXD_DIR="${LXD_FOUR_DIR}" lxd shutdown
+
+  rm -f "${LXD_ONE_DIR}/unix.socket"
+  rm -f "${LXD_TWO_DIR}/unix.socket"
+  rm -f "${LXD_THREE_DIR}/unix.socket"
+  rm -f "${LXD_FOUR_DIR}/unix.socket"
+
+  teardown_clustering_netns
+  teardown_clustering_bridge
+
+  kill_lxd "${LXD_ONE_DIR}"
+  kill_lxd "${LXD_TWO_DIR}"
+  kill_lxd "${LXD_THREE_DIR}"
+  kill_lxd "${LXD_FOUR_DIR}"
 }

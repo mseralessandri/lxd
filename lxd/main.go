@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"fmt"
 	"os"
 
 	"github.com/canonical/go-dqlite/v3"
@@ -10,10 +11,10 @@ import (
 	"github.com/canonical/lxd/lxd/daemon"
 	"github.com/canonical/lxd/lxd/db"
 	"github.com/canonical/lxd/lxd/events"
-	"github.com/canonical/lxd/lxd/operations"
 	"github.com/canonical/lxd/lxd/response"
 	"github.com/canonical/lxd/lxd/rsync"
 	cli "github.com/canonical/lxd/shared/cmd"
+	"github.com/canonical/lxd/shared/features"
 	"github.com/canonical/lxd/shared/logger"
 	"github.com/canonical/lxd/shared/version"
 )
@@ -50,9 +51,6 @@ func (c *cmdGlobal) Run(cmd *cobra.Command, args []string) error {
 	rsync.Debug = c.flagLogDebug
 	daemon.Verbose = c.flagLogVerbose
 
-	// Set debug for the operations package
-	operations.Init(daemon.Debug)
-
 	// Set debug for the response package
 	response.Init(daemon.Debug, db.SmartErrors)
 
@@ -82,6 +80,13 @@ func (c *cmdGlobal) rawArgs(cmd *cobra.Command) []string {
 }
 
 func main() {
+	// Load feature previews before registering commands
+	err := features.LoadFromEnv(features.EnvVar)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
+
 	// daemon command (main)
 	daemonCmd := cmdDaemon{}
 	app := daemonCmd.command()
@@ -223,7 +228,7 @@ func main() {
 	app.AddCommand(clusterCmd.Command())
 
 	// Run the main command and handle errors
-	err := app.Execute()
+	err = app.Execute()
 	if err != nil {
 		os.Exit(1)
 	}

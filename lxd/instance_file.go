@@ -16,8 +16,8 @@ import (
 
 	"github.com/pkg/sftp"
 
+	"github.com/canonical/lxd/lxd/idmap"
 	"github.com/canonical/lxd/lxd/instance"
-	"github.com/canonical/lxd/lxd/instance/instancetype"
 	"github.com/canonical/lxd/lxd/lifecycle"
 	"github.com/canonical/lxd/lxd/request"
 	"github.com/canonical/lxd/lxd/response"
@@ -79,6 +79,55 @@ func instanceFileHandler(d *Daemon, r *http.Request) response.Response {
 	default:
 		return response.NotFound(fmt.Errorf("Method %q not found", r.Method))
 	}
+}
+
+// instanceFileStat opens an SFTP client for the instance, stats the given path and prepares
+// the common X-LXD-* response headers. On success the caller takes ownership of the returned
+// client and is responsible for closing it. If a non-nil response is returned, it describes an
+// error, the client has already been closed, and the other return values must be ignored.
+func instanceFileStat(inst instance.Instance, path string) (client *sftp.Client, stat os.FileInfo, fileType string, headers map[string]string, resp response.Response) {
+	// Get a SFTP client. Bind the cleanup hook to this local variable rather than the named
+	// "client" result, so that error-path returns (which reset "client" to nil) cannot turn
+	// the deferred Close into a nil pointer dereference.
+	sftpClient, err := inst.FileSFTP()
+	if err != nil {
+		return nil, nil, "", nil, response.InternalError(err)
+	}
+
+	// Close the client on our own failures; on success the caller takes ownership.
+	revert := revert.New()
+	defer revert.Fail()
+	revert.Add(func() { _ = sftpClient.Close() })
+
+	// Get the file stats.
+	stat, err = sftpClient.Lstat(path)
+	if err != nil {
+		return nil, nil, "", nil, response.SmartError(fmt.Errorf("Failed accessing %q in instance %q: %w", path, inst.Name(), err))
+	}
+
+	fileStat, ok := stat.Sys().(*sftp.FileStat)
+	if !ok {
+		return nil, nil, "", nil, response.InternalError(fmt.Errorf("Failed getting file stat for %q", path))
+	}
+
+	fileType = "file"
+	if stat.Mode().IsDir() {
+		fileType = "directory"
+	} else if stat.Mode()&os.ModeSymlink == os.ModeSymlink {
+		fileType = "symlink"
+	}
+
+	// Prepare the response.
+	headers = map[string]string{
+		"X-LXD-uid":      strconv.FormatUint(uint64(fileStat.UID), 10),
+		"X-LXD-gid":      strconv.FormatUint(uint64(fileStat.GID), 10),
+		"X-LXD-mode":     fmt.Sprintf("%04o", stat.Mode().Perm()),
+		"X-LXD-modified": stat.ModTime().UTC().String(),
+		"X-LXD-type":     fileType,
+	}
+
+	revert.Success()
+	return sftpClient, stat, fileType, headers, nil
 }
 
 // swagger:operation GET /1.0/instances/{name}/files instances instance_files_get
@@ -153,40 +202,13 @@ func instanceFileGet(ctx context.Context, s *state.State, inst instance.Instance
 	revert := revert.New()
 	defer revert.Fail()
 
-	// Get a SFTP client.
-	client, err := inst.FileSFTP()
-	if err != nil {
-		return response.InternalError(err)
+	// Get a SFTP client, stat the file and prepare the common headers.
+	client, stat, fileType, headers, resp := instanceFileStat(inst, path)
+	if resp != nil {
+		return resp
 	}
 
 	revert.Add(func() { _ = client.Close() })
-
-	// Get the file stats.
-	stat, err := client.Lstat(path)
-	if err != nil {
-		return response.SmartError(fmt.Errorf("Failed accessing %q in instance %q: %w", path, inst.Name(), err))
-	}
-
-	fileType := "file"
-	if stat.Mode().IsDir() {
-		fileType = "directory"
-	} else if stat.Mode()&os.ModeSymlink == os.ModeSymlink {
-		fileType = "symlink"
-	}
-
-	fs, ok := stat.Sys().(*sftp.FileStat)
-	if !ok {
-		return response.InternalError(fmt.Errorf("Failed getting file stat for %q", path))
-	}
-
-	// Prepare the response.
-	headers := map[string]string{
-		"X-LXD-uid":      strconv.FormatUint(uint64(fs.UID), 10),
-		"X-LXD-gid":      strconv.FormatUint(uint64(fs.GID), 10),
-		"X-LXD-mode":     fmt.Sprintf("%04o", stat.Mode().Perm()),
-		"X-LXD-modified": stat.ModTime().UTC().String(),
-		"X-LXD-type":     fileType,
-	}
 
 	switch fileType {
 	case "file":
@@ -203,9 +225,10 @@ func instanceFileGet(ctx context.Context, s *state.State, inst instance.Instance
 		revert.Success()
 
 		// Make a file response struct.
+		fileName := filepath.Base(path)
 		files := make([]response.FileResponseEntry, 1)
-		files[0].Identifier = filepath.Base(path)
-		files[0].Filename = filepath.Base(path)
+		files[0].Identifier = fileName
+		files[0].Filename = fileName
 		files[0].File = file
 		files[0].FileSize = stat.Size()
 		files[0].FileModified = stat.ModTime()
@@ -237,9 +260,10 @@ func instanceFileGet(ctx context.Context, s *state.State, inst instance.Instance
 		}
 
 		// Make a file response struct.
+		fileName := filepath.Base(path)
 		files := make([]response.FileResponseEntry, 1)
-		files[0].Identifier = filepath.Base(path)
-		files[0].Filename = filepath.Base(path)
+		files[0].Identifier = fileName
+		files[0].Filename = fileName
 		files[0].File = bytes.NewReader([]byte(target))
 		files[0].FileModified = time.Now()
 		files[0].FileSize = int64(len(target))
@@ -247,23 +271,22 @@ func instanceFileGet(ctx context.Context, s *state.State, inst instance.Instance
 		s.Events.SendLifecycle(inst.Project().Name, lifecycle.InstanceFileRetrieved.Event(ctx, inst, logger.Ctx{"path": path}))
 		return response.FileResponse(files, headers)
 	case "directory":
-		dirEnts := []string{}
-
 		// List the directory.
 		entries, err := client.ReadDir(path)
 		if err != nil {
 			return response.SmartError(err)
 		}
 
+		dirEnts := make([]string, 0, len(entries))
 		for _, entry := range entries {
 			dirEnts = append(dirEnts, entry.Name())
 		}
 
 		s.Events.SendLifecycle(inst.Project().Name, lifecycle.InstanceFileRetrieved.Event(ctx, inst, logger.Ctx{"path": path}))
 		return response.SyncResponseHeaders(true, dirEnts, headers)
-	default:
-		return response.InternalError(fmt.Errorf("Bad file type: %s", fileType))
 	}
+
+	return response.InternalError(fmt.Errorf("Bad file type: %s", fileType))
 }
 
 // swagger:operation HEAD /1.0/instances/{name}/files instances instance_files_head
@@ -317,43 +340,13 @@ func instanceFileGet(ctx context.Context, s *state.State, inst instance.Instance
 //	  "500":
 //	    $ref: "#/responses/InternalServerError"
 func instanceFileHead(inst instance.Instance, path string) response.Response {
-	revert := revert.New()
-	defer revert.Fail()
-
-	// Get a SFTP client.
-	client, err := inst.FileSFTP()
-	if err != nil {
-		return response.InternalError(err)
+	// Get a SFTP client, stat the file and prepare the common headers.
+	client, stat, fileType, headers, resp := instanceFileStat(inst, path)
+	if resp != nil {
+		return resp
 	}
 
-	revert.Add(func() { _ = client.Close() })
-
-	// Get the file stats.
-	stat, err := client.Lstat(path)
-	if err != nil {
-		return response.SmartError(fmt.Errorf("Failed accessing %q in instance %q: %w", path, inst.Name(), err))
-	}
-
-	fileType := "file"
-	if stat.Mode().IsDir() {
-		fileType = "directory"
-	} else if stat.Mode()&os.ModeSymlink == os.ModeSymlink {
-		fileType = "symlink"
-	}
-
-	fs, ok := stat.Sys().(*sftp.FileStat)
-	if !ok {
-		return response.InternalError(fmt.Errorf("Failed getting file stat for %q", path))
-	}
-
-	// Prepare the response.
-	headers := map[string]string{
-		"X-LXD-uid":      strconv.FormatUint(uint64(fs.UID), 10),
-		"X-LXD-gid":      strconv.FormatUint(uint64(fs.GID), 10),
-		"X-LXD-mode":     fmt.Sprintf("%04o", stat.Mode().Perm()),
-		"X-LXD-modified": stat.ModTime().UTC().String(),
-		"X-LXD-type":     fileType,
-	}
+	defer func() { _ = client.Close() }()
 
 	if fileType == "file" {
 		headers["Content-Type"] = "application/octet-stream"
@@ -374,14 +367,9 @@ func instanceFileHead(inst instance.Instance, path string) response.Response {
 }
 
 // For containers we can only run chown/chgrp if target uid/gid is within uidmap allowed range.
-func effectiveFileOwnership(inst instance.Instance, headers *shared.LXDFileHeaders, fileName string) (uid, gid int64, err error) {
+func effectiveFileOwnership(c instance.Container, headers *shared.LXDFileHeaders, fileName string) (uid, gid int64, err error) {
 	uid = headers.UID
 	gid = headers.GID
-
-	c, ok := inst.(instance.Container)
-	if !ok {
-		return 0, 0, fmt.Errorf("Invalid instance type: %T", inst)
-	}
 
 	idmapset, err := c.CurrentIdmap()
 	if err != nil {
@@ -393,24 +381,55 @@ func effectiveFileOwnership(inst instance.Instance, headers *shared.LXDFileHeade
 	}
 
 	idmapranges, err := idmapset.ValidRanges()
-	if len(idmapranges) != 2 {
+	if err != nil {
 		return 0, 0, err
 	}
 
-	l := logger.AddContext(logger.Ctx{"project": inst.Project().Name, "instance": inst.Name(), "file": fileName})
+	newUID, newGID := effectiveOwnershipInRanges(idmapranges, uid, gid)
+
+	l := logger.AddContext(logger.Ctx{"project": c.Project().Name, "instance": c.Name(), "file": fileName})
+	if newUID != uid {
+		l.Info("Requested UID not within idmap range", logger.Ctx{"uid": uid})
+	}
+
+	if newGID != gid {
+		l.Info("Requested GID not within idmap range", logger.Ctx{"gid": gid})
+	}
+
+	return newUID, newGID, nil
+}
+
+// effectiveOwnershipInRanges adjusts the given UID and GID against the allowed idmap ranges.
+// The idmap can contain multiple non-contiguous UID/GID ranges (e.g. from raw.idmap), so a
+// UID/GID is considered valid when it falls within any range of the matching type. An ID that
+// matches no range of its type is set to -1, while an ID whose type has no ranges is left as-is.
+func effectiveOwnershipInRanges(idmapranges []*idmap.IdRange, uid int64, gid int64) (effectiveUID int64, effectiveGID int64) {
+	var hasUIDRange, hasGIDRange, uidValid, gidValid bool
 	for _, idmaprange := range idmapranges {
-		if idmaprange.Isuid && !idmaprange.Contains(headers.UID) {
-			l.Info("Requested UID not within idmap range", logger.Ctx{"uid": uid})
-			uid = -1
+		if idmaprange.Isuid {
+			hasUIDRange = true
+			if idmaprange.Contains(uid) {
+				uidValid = true
+			}
 		}
 
-		if idmaprange.Isgid && !idmaprange.Contains(headers.GID) {
-			l.Info("Requested GID not within idmap range", logger.Ctx{"gid": gid})
-			gid = -1
+		if idmaprange.Isgid {
+			hasGIDRange = true
+			if idmaprange.Contains(gid) {
+				gidValid = true
+			}
 		}
 	}
 
-	return uid, gid, nil
+	if hasUIDRange && !uidValid {
+		uid = -1
+	}
+
+	if hasGIDRange && !gidValid {
+		gid = -1
+	}
+
+	return uid, gid
 }
 
 // swagger:operation POST /1.0/instances/{name}/files instances instance_files_post
@@ -520,7 +539,10 @@ func instanceFilePost(ctx context.Context, s *state.State, inst instance.Instanc
 
 		defer func() { _ = file.Close() }()
 
-		// Go to the end of the file.
+		// Seek to the end of the file so appended writes land past the existing
+		// content. We cannot rely on os.O_APPEND here: the sftp server writes
+		// with WriteAt using client-supplied offsets and treats the append flag
+		// as a no-op, so the client's offset must be positioned explicitly.
 		_, err = file.Seek(0, io.SeekEnd)
 		if err != nil {
 			return response.InternalError(err)
@@ -549,8 +571,9 @@ func instanceFilePost(ctx context.Context, s *state.State, inst instance.Instanc
 		if !exists || headers.UIDModifyExisting || headers.GIDModifyExisting {
 			if headers.UID >= 0 || headers.GID >= 0 {
 				// For containers, make sure we are not trying to apply IDs outside of the allowed range.
-				if inst.Type() == instancetype.Container {
-					headers.UID, headers.GID, err = effectiveFileOwnership(inst, headers, file.Name())
+				c, ok := inst.(instance.Container)
+				if ok {
+					headers.UID, headers.GID, err = effectiveFileOwnership(c, headers, file.Name())
 					if err != nil {
 						return response.SmartError(err)
 					}
@@ -567,19 +590,21 @@ func instanceFilePost(ctx context.Context, s *state.State, inst instance.Instanc
 		return response.EmptySyncResponse
 	case "symlink":
 		// Figure out target.
-		target, err := io.ReadAll(r.Body)
+		targetBytes, err := io.ReadAll(r.Body)
 		if err != nil {
 			return response.InternalError(err)
 		}
 
+		target := string(targetBytes)
+
 		// Check if already setup.
 		currentTarget, err := client.ReadLink(path)
-		if err == nil && currentTarget == string(target) {
+		if err == nil && currentTarget == target {
 			return response.EmptySyncResponse
 		}
 
 		// Create the symlink.
-		err = client.Symlink(string(target), path)
+		err = client.Symlink(target, path)
 		if err != nil {
 			return response.SmartError(fmt.Errorf("Failed creating symlink %q in instance %q: %w", path, inst.Name(), err))
 		}
@@ -612,8 +637,9 @@ func instanceFilePost(ctx context.Context, s *state.State, inst instance.Instanc
 		// Set file ownership.
 		if headers.UID >= 0 || headers.GID >= 0 {
 			// For containers, make sure we are not trying to apply IDs outside of the allowed range.
-			if inst.Type() == instancetype.Container {
-				headers.UID, headers.GID, err = effectiveFileOwnership(inst, headers, path)
+			c, ok := inst.(instance.Container)
+			if ok {
+				headers.UID, headers.GID, err = effectiveFileOwnership(c, headers, path)
 				if err != nil {
 					return response.SmartError(err)
 				}

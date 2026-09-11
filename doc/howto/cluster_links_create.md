@@ -7,7 +7,21 @@ myst:
 (howto-cluster-links-create)=
 # How to create cluster links
 
-{ref}`Cluster links <exp-cluster-links>` connect separate LXD clusters. There are two link types — bidirectional and unidirectional — each with a different creation flow.
+{ref}`Cluster links <exp-cluster-links>` connect separate LXD clusters.
+There are three link types (bidirectional, unidirectional, and public), each with a different creation flow.
+
+## Network addresses
+
+Cluster links use LXD's existing HTTPS listeners. On a clustered server, link trust tokens
+and bidirectional activation requests advertise the local member's `cluster.https_address`,
+including its port. Address refresh subsequently discovers the remote cluster's member addresses.
+These addresses must be reachable from the linked cluster.
+
+On a standalone server, bootstrap addresses come from `core.https_address`. A wildcard
+listener includes the host's global unicast addresses, which can include internal networks.
+Configure a specific `core.https_address` to restrict these advertised addresses. This also
+restricts the core HTTPS listener; cluster links do not create a separate listener or select
+an outbound source interface.
 
 (howto-cluster-links-auth)=
 ## Prepare authentication
@@ -69,15 +83,14 @@ To create a bidirectional cluster link between two clusters (Cluster A and Clust
    ```
    ````
    ````{group-tab} UI
-   For a single-node cluster, click {guilabel}`Server` in the navigation sidebar, then select the {guilabel}`Cluster links` tab in the main content pane. Otherwise, click {guilabel}`Clustering` in the navigation sidebar, then select {guilabel}`Links` from the expanded drop-down list.
+   Click {guilabel}`Clustering` in the navigation sidebar, then select {guilabel}`Links` from the expanded drop-down list.
 
    Click on the {guilabel}`+ Create cluster link` button to open the side panel.
 
    Enter a name and optionally a description for the new cluster link.
    Leave {guilabel}`Generate token` checked, select relevant authentication group(s), and click {guilabel}`Create link`.
 
-   In the modal, copy the trust token by clicking the {guilabel}`Copy token` button next to the token. You'll need it for the next step.
-
+   In the modal, click the copy button {{copy_button}} to copy the token.
    ````
    `````
 
@@ -102,7 +115,7 @@ To create a bidirectional cluster link between two clusters (Cluster A and Clust
    ```
    ````
    ````{group-tab} UI
-   For a single-node cluster, click {guilabel}`Server` in the navigation sidebar, then select the {guilabel}`Cluster links` tab in the main content pane. Otherwise, click {guilabel}`Clustering` in the navigation sidebar, then select {guilabel}`Links` from the expanded drop-down list.
+   Click {guilabel}`Clustering` in the navigation sidebar, then select {guilabel}`Links` from the expanded drop-down list.
 
    Click on the {guilabel}`+ Create cluster link` button to open the side panel.
 
@@ -122,7 +135,7 @@ Follow these steps:
 1. On Cluster B (the target), issue a pending identity token:
 
    ```bash
-   lxc auth identity create cluster-link/<name-for-cluster-a> --auth-group <auth-group-name>
+   lxc auth identity create cluster-link/<name-for-cluster-a> --group <auth-group-name>
    ```
 
    This command creates a pending `Cluster link certificate` identity on Cluster B and returns a trust token.
@@ -130,7 +143,7 @@ Follow these steps:
    Example:
 
    ```bash
-   lxc auth identity create cluster-link/cluster_a --auth-group clusters
+   lxc auth identity create cluster-link/cluster_a --group clusters
    ```
 
 1. On Cluster A (the initiator), create the cluster link using the token from Cluster B:
@@ -151,6 +164,35 @@ Follow these steps:
    ```
 
 After these steps, Cluster A has a link with `type: unidirectional` and no associated identity. Cluster B has an active `Cluster link certificate` identity for Cluster A but no cluster link record.
+
+(howto-cluster-links-create-public)=
+## Create a public cluster link
+
+A public link lets Cluster A connect to Cluster B without any token exchange. Cluster A fetches and pins Cluster B's TLS certificate, but Cluster B has no record of the connection. Neither cluster creates an identity for the other. Use this type when Cluster B exposes resources publicly or when you want anonymous read access.
+
+No authentication groups are required for public links.
+
+On Cluster A (the initiator), create the cluster link:
+
+```bash
+lxc cluster link create <name-for-cluster-b> --public --remote-address <cluster-b-address>
+```
+
+This command:
+- Fetches Cluster B's TLS certificate through the LXD server and displays its fingerprint.
+- Prompts you to confirm the fingerprint.
+- If confirmed, pins the certificate and activates the link on Cluster A. If declined, the pending link is removed.
+
+Until you confirm the fingerprint, the link exists but is inert: no certificate is pinned and no address is set, so it cannot be used to reach Cluster B.
+If the command is interrupted at the prompt, the pending link is left behind — re-running the same command refreshes it, or you can remove it with [`lxc cluster link delete`](lxc_cluster_link_delete.md).
+
+Example:
+
+```bash
+lxc cluster link create cluster_b --public --remote-address 10.0.0.2:8443
+```
+
+After these steps, Cluster A has a link with `type: public` and no associated identity. Cluster B has no link or identity for Cluster A.
 
 (howto-cluster-links-identities)=
 ## View the underlying identities

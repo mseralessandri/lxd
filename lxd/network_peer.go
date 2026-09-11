@@ -22,16 +22,18 @@ import (
 )
 
 var networkPeersCmd = APIEndpoint{
-	Path:        "networks/{networkName}/peers",
-	MetricsType: entity.TypeNetwork,
+	Path:            "networks/{networkName}/peers",
+	MetricsType:     entity.TypeNetwork,
+	ProjectSpecific: true,
 
 	Get:  APIEndpointAction{Handler: networkPeersGet, AccessHandler: networkAccessHandler(auth.EntitlementCanView)},
 	Post: APIEndpointAction{Handler: networkPeersPost, AccessHandler: networkAccessHandler(auth.EntitlementCanEdit)},
 }
 
 var networkPeerCmd = APIEndpoint{
-	Path:        "networks/{networkName}/peers/{peerName}",
-	MetricsType: entity.TypeNetwork,
+	Path:            "networks/{networkName}/peers/{peerName}",
+	MetricsType:     entity.TypeNetwork,
+	ProjectSpecific: true,
 
 	Delete: APIEndpointAction{Handler: networkPeerDelete, AccessHandler: networkAccessHandler(auth.EntitlementCanEdit)},
 	Get:    APIEndpointAction{Handler: networkPeerGet, AccessHandler: networkAccessHandler(auth.EntitlementCanView)},
@@ -290,7 +292,7 @@ func networkPeersPost(d *Daemon, r *http.Request) response.Response {
 	args := operations.OperationArgs{
 		ProjectName: details.requestProject.Name,
 		Type:        operationtype.NetworkPeerCreate,
-		Class:       operations.OperationClassTask,
+		Class:       operationtype.OperationClassTask,
 		RunHook:     run,
 		EntityURL:   entity.NetworkURL(effectiveProjectName, details.networkName),
 		Metadata: map[string]any{
@@ -303,7 +305,7 @@ func networkPeersPost(d *Daemon, r *http.Request) response.Response {
 		return response.InternalError(err)
 	}
 
-	return operations.OperationResponse(op)
+	return response.OperationResponse(op)
 }
 
 // swagger:operation DELETE /1.0/networks/{networkName}/peers/{peerName} network-peers network_peer_delete
@@ -379,7 +381,7 @@ func networkPeerDelete(d *Daemon, r *http.Request) response.Response {
 	args := operations.OperationArgs{
 		ProjectName: details.requestProject.Name,
 		Type:        operationtype.NetworkPeerDelete,
-		Class:       operations.OperationClassTask,
+		Class:       operationtype.OperationClassTask,
 		RunHook:     run,
 		EntityURL:   entity.NetworkURL(effectiveProjectName, details.networkName),
 	}
@@ -389,7 +391,7 @@ func networkPeerDelete(d *Daemon, r *http.Request) response.Response {
 		return response.InternalError(err)
 	}
 
-	return operations.OperationResponse(op)
+	return response.OperationResponse(op)
 }
 
 // swagger:operation GET /1.0/networks/{networkName}/peers/{peerName} network-peers network_peer_get
@@ -608,7 +610,7 @@ func networkPeerPut(d *Daemon, r *http.Request) response.Response {
 	args := operations.OperationArgs{
 		ProjectName: details.requestProject.Name,
 		Type:        operationtype.NetworkPeerUpdate,
-		Class:       operations.OperationClassTask,
+		Class:       operationtype.OperationClassTask,
 		RunHook:     run,
 		EntityURL:   entity.NetworkURL(effectiveProjectName, details.networkName),
 	}
@@ -618,5 +620,5 @@ func networkPeerPut(d *Daemon, r *http.Request) response.Response {
 		return response.InternalError(err)
 	}
 
-	return operations.OperationResponse(op)
+	return response.OperationResponse(op)
 }

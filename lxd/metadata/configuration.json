@@ -40,6 +40,22 @@
 							"shortdesc": "Cluster link member addresses.",
 							"type": "string"
 						}
+					},
+					{
+						"volatile.pending_address": {
+							"longdesc": "The address that was contacted and verified for a pending public cluster link, awaiting confirmation.",
+							"scope": "global",
+							"shortdesc": "Pending public cluster link address.",
+							"type": "string"
+						}
+					},
+					{
+						"volatile.pending_certificate": {
+							"longdesc": "The PEM-encoded certificate fetched for a pending public cluster link, awaiting confirmation.",
+							"scope": "global",
+							"shortdesc": "Pending public cluster link certificate.",
+							"type": "string"
+						}
 					}
 				]
 			}
@@ -232,15 +248,14 @@
 							"defaultdesc": "`true`",
 							"longdesc": "",
 							"required": "no",
-							"shortdesc": "Whether to fail if the source doesn’t exist",
+							"shortdesc": "Whether to fail instance start if the source doesn’t exist",
 							"type": "bool"
 						}
 					},
 					{
 						"shift": {
-							"condition": "container",
 							"defaultdesc": "`false`",
-							"longdesc": "If enabled, this option sets up a shifting overlay to translate the source UID/GID to match the container instance.",
+							"longdesc": "For containers, if enabled, this option sets up a shifting overlay to translate the source UID/GID to match the instance.\nFor virtual machines, the source UID/GID is passed through unchanged, even if the instance `raw.idmap` is set.",
 							"required": "no",
 							"shortdesc": "Whether to set up a UID/GID shifting overlay",
 							"type": "bool"
@@ -2198,48 +2213,6 @@
 					}
 				]
 			},
-			"nvidia": {
-				"keys": [
-					{
-						"nvidia.driver.capabilities": {
-							"condition": "container",
-							"defaultdesc": "`compute,utility`",
-							"liveupdate": "no",
-							"longdesc": "The specified driver capabilities are used to set `libnvidia-container NVIDIA_DRIVER_CAPABILITIES`.",
-							"shortdesc": "What driver capabilities the instance needs",
-							"type": "string"
-						}
-					},
-					{
-						"nvidia.require.cuda": {
-							"condition": "container",
-							"liveupdate": "no",
-							"longdesc": "The specified version expression is used to set `libnvidia-container NVIDIA_REQUIRE_CUDA`.",
-							"shortdesc": "Required CUDA version",
-							"type": "string"
-						}
-					},
-					{
-						"nvidia.require.driver": {
-							"condition": "container",
-							"liveupdate": "no",
-							"longdesc": "The specified version expression is used to set `libnvidia-container NVIDIA_REQUIRE_DRIVER`.",
-							"shortdesc": "Required driver version",
-							"type": "string"
-						}
-					},
-					{
-						"nvidia.runtime": {
-							"condition": "container",
-							"defaultdesc": "`false`",
-							"liveupdate": "no",
-							"longdesc": "",
-							"shortdesc": "Whether to pass the host NVIDIA and CUDA runtime libraries into the instance",
-							"type": "bool"
-						}
-					}
-				]
-			},
 			"placement": {
 				"keys": [
 					{
@@ -2257,7 +2230,7 @@
 					{
 						"raw.apparmor": {
 							"liveupdate": "yes",
-							"longdesc": "The specified entries are appended to the generated profile.",
+							"longdesc": "The specified entries are appended to the generated profile.\nThis is a low-level option and is not recommended for production use, as it allows for unsupported configurations that may cease to work in future versions.",
 							"shortdesc": "AppArmor profile entries",
 							"type": "blob"
 						}
@@ -2274,7 +2247,7 @@
 						"raw.lxc": {
 							"condition": "container",
 							"liveupdate": "no",
-							"longdesc": "",
+							"longdesc": "Additional LXC configuration is appended to the generated configuration.\nThis is a low-level option and is not recommended for production use, as it allows for unsupported configurations that may cease to work in future versions.",
 							"shortdesc": "Raw LXC configuration to be appended to the generated one",
 							"type": "blob"
 						}
@@ -2283,7 +2256,7 @@
 						"raw.qemu": {
 							"condition": "virtual machine",
 							"liveupdate": "no",
-							"longdesc": "",
+							"longdesc": "Additional QEMU command line configuration is appended to the generated command line.\nThis is a low-level option and is not recommended for production use, as it allows for unsupported configurations that may cease to work in future versions.",
 							"shortdesc": "Raw QEMU configuration to be appended to the generated command line",
 							"type": "blob"
 						}
@@ -2292,7 +2265,7 @@
 						"raw.qemu.conf": {
 							"condition": "virtual machine",
 							"liveupdate": "no",
-							"longdesc": "See {ref}`instance-options-qemu` for more information.",
+							"longdesc": "This is a low-level option and is not recommended for production use, as it allows for unsupported configurations that may cease to work in future versions.\nSee {ref}`instance-options-qemu` for more information.",
 							"shortdesc": "Addition/override to the generated `qemu.conf` file",
 							"type": "blob"
 						}
@@ -2301,7 +2274,7 @@
 						"raw.seccomp": {
 							"condition": "container",
 							"liveupdate": "no",
-							"longdesc": "",
+							"longdesc": "Additional Seccomp configuration is appended to the generated policy.\nThis is a low-level option and is not recommended for production use, as it allows for unsupported configurations that may cease to work in future versions.",
 							"shortdesc": "Raw Seccomp configuration",
 							"type": "blob"
 						}
@@ -3638,7 +3611,7 @@
 					},
 					{
 						"raw.dnsmasq": {
-							"longdesc": "",
+							"longdesc": "Additional `dnsmasq` configuration is appended to the generated configuration file.\nThis is a low-level option and is not recommended for production use, as it allows for unsupported configurations that may cease to work in future versions.",
 							"scope": "global",
 							"shortdesc": "Additional `dnsmasq` configuration to append to the configuration file",
 							"type": "string"
@@ -4719,7 +4692,7 @@
 						"features.networks": {
 							"defaultdesc": "`false`",
 							"initialvaluedesc": "`false`",
-							"longdesc": "",
+							"longdesc": "This feature requires `features.profiles` to be enabled.",
 							"shortdesc": "Whether to use a separate set of networks for the project",
 							"type": "bool"
 						}
@@ -4914,7 +4887,7 @@
 					{
 						"restricted.containers.privilege": {
 							"defaultdesc": "`unprivileged`",
-							"longdesc": "Possible values are `unprivileged`, `isolated`, and `allow`.\n\n- When set to `unpriviliged`, this option prevents setting {config:option}`instance-security:security.privileged` to `true`.\n- When set to `isolated`, this option prevents setting {config:option}`instance-security:security.privileged` to `true` and forces using a unique idmap per container using {config:option}`instance-security:security.idmap.isolated` set to `true`.\n- When set to `allow`, there is no restriction.",
+							"longdesc": "Possible values are `unprivileged`, `isolated`, and `allow`.\n\n- When set to `unprivileged`, this option prevents setting {config:option}`instance-security:security.privileged` to `true`.\n- When set to `isolated`, this option prevents setting {config:option}`instance-security:security.privileged` to `true` and forces using a unique idmap per container using {config:option}`instance-security:security.idmap.isolated` set to `true`.\n- When set to `allow`, there is no restriction.",
 							"shortdesc": "Which settings for privileged containers to prevent",
 							"type": "string"
 						}
@@ -5140,14 +5113,6 @@
 							"scope": "global",
 							"shortdesc": "Cron expression for the replication schedule.",
 							"type": "string"
-						}
-					},
-					{
-						"snapshot": {
-							"longdesc": "",
-							"scope": "global",
-							"shortdesc": "Whether to snapshot instances before replication.",
-							"type": "bool"
 						}
 					}
 				]
@@ -5754,7 +5719,7 @@
 					{
 						"oidc.session.expiry": {
 							"defaultdesc": "`1w`",
-							"longdesc": "The duration of an OIDC session.\n\nThis configuration option accepts multiple space-separated values of the form `[0-9]+(S|M|H|d|w|m|y)`,\nwhere `S` is seconds, `M` is minutes, `H` is hours, `d` is days, `w` is weeks, `m` is months, and `y` is years.\nFor example, `1d 3H` is 1 day and 3 hours.\n\nThe default value is `1w` (1 week).\nThe minimum value is `1d` (1 day).",
+							"longdesc": "The duration of an OIDC session.\n\nThis configuration option accepts multiple space-separated values of the form `[0-9]+(S|M|H|d|w|m|y)`,\nwhere `S` is seconds, `M` is minutes, `H` is hours, `d` is days, `w` is weeks, `m` is months, and `y` is years.\nFor example, `1d 3H` is 1 day and 3 hours.\n\nThe default value is `1w` (1 week).\nThe minimum value is `1H` (1 hour).",
 							"scope": "global",
 							"shortdesc": "The duration of an OIDC session",
 							"type": "string"
@@ -5775,7 +5740,7 @@
 					},
 					{
 						"alletra.mode": {
-							"defaultdesc": "the discovered mode",
+							"defaultdesc": "`nvme/tcp`",
 							"longdesc": "The mode to use to map storage volumes to the local server.\nSupported values are `iscsi` and `nvme/tcp`.",
 							"shortdesc": "How volumes are mapped to the local server",
 							"type": "string"
@@ -5783,7 +5748,7 @@
 					},
 					{
 						"alletra.target": {
-							"defaultdesc": "the discovered mode",
+							"defaultdesc": "all available targets",
 							"longdesc": "A comma-separated list of target addresses. If empty, LXD discovers and connects to all available targets. Otherwise, it only connects to the specified addresses.",
 							"shortdesc": "List of target addresses.",
 							"type": "string"
@@ -7047,7 +7012,7 @@
 					},
 					{
 						"powerflex.mode": {
-							"defaultdesc": "the discovered mode",
+							"defaultdesc": "`nvme/tcp`",
 							"longdesc": "The mode gets discovered automatically if the system provides the necessary kernel modules.\nThis can be either `nvme/tcp` or `sdc`.",
 							"scope": "global",
 							"shortdesc": "How volumes are mapped to the local server",
@@ -7292,9 +7257,8 @@
 					},
 					{
 						"powerstore.mode": {
-							"defaultdesc": "the discovered mode",
-							"longdesc": "The mode to use to map PowerStore volumes to the local server.\nSupported values are `iscsi` and `scsi/fc`.",
-							"required": "true",
+							"defaultdesc": "`nvme/tcp`",
+							"longdesc": "The mode to use to map PowerStore volumes to the local server.\nSupported values are `iscsi`, `scsi/fc`, and `nvme/tcp`.",
 							"scope": "global",
 							"shortdesc": "How volumes are mapped to the local server",
 							"type": "string"
@@ -7302,7 +7266,7 @@
 					},
 					{
 						"powerstore.target": {
-							"defaultdesc": "target addresses",
+							"defaultdesc": "all available targets",
 							"longdesc": "A comma-separated list of target addresses. If empty, LXD discovers and connects to all available targets. Otherwise, it only connects to the specified addresses.",
 							"shortdesc": "List of target addresses the LXD connects to.",
 							"type": "string"
@@ -7509,7 +7473,7 @@
 					},
 					{
 						"pure.mode": {
-							"defaultdesc": "the discovered mode",
+							"defaultdesc": "`nvme/tcp`",
 							"longdesc": "The mode to use to map Pure Storage volumes to the local server.\nSupported values are `iscsi` and `nvme/tcp`.",
 							"shortdesc": "How volumes are mapped to the local server",
 							"type": "string"
@@ -7517,7 +7481,7 @@
 					},
 					{
 						"pure.target": {
-							"defaultdesc": "the discovered mode",
+							"defaultdesc": "all available targets",
 							"longdesc": "A comma-separated list of target addresses. If empty, LXD discovers and connects to all available targets. Otherwise, it only connects to the specified addresses.",
 							"shortdesc": "List of target addresses.",
 							"type": "string"

@@ -60,7 +60,18 @@ _server_config_auth() {
 
 _server_config_access() {
   # test untrusted server GET
-  ! my_curl "https://$(< "${LXD_ADDR}")/1.0" | grep -wF "environment" || false
+  local UNTRUSTED_GET
+  UNTRUSTED_GET="$(curl --insecure --silent --fail-with-body "https://${LXD_ADDR}/1.0")"
+
+  if [ -z "${UNTRUSTED_GET}" ]; then
+    echo "Untrusted server GET returned an empty response"
+    false
+  fi
+
+  if grep -wF "environment" <<< "${UNTRUSTED_GET}"; then
+    echo "Untrusted server GET returned environment"
+    false
+  fi
 
   # test authentication type, only tls and bearer are enabled by default
   curl --silent --unix-socket "$LXD_DIR/unix.socket" "lxd/1.0" | jq --exit-status '.metadata.auth_methods == ["tls","bearer"]'
@@ -116,13 +127,15 @@ _server_config_ui_serving() {
 }
 
 _server_config_storage() {
-  local lxd_backend
+  local lxd_backend output
 
   lxd_backend=$(storage_backend "$LXD_DIR")
   if [ "$lxd_backend" = "ceph" ]; then
     # The volume doesn't have to be present as the check errors after testing for the remote storage pool.
-    ! lxc config set storage.backups_volume "${pool}/foo" | grep -F "Error: Failed validation of \"storage.backups_volume\": Remote storage pool \"${pool}\" cannot be used" || false
-    ! lxc config set storage.images_volume "${pool}/foo" | grep -F "Error: Failed validation of \"storage.images_volume\": Remote storage pool \"${pool}\" cannot be used" || false
+    ! output=$(lxc config set storage.backups_volume "${pool}/foo" 2>&1) || false
+    [[ "${output}" == "Error: Failed validation of \"storage.backups_volume\": Remote storage pool \"${pool}\" cannot be used" ]]
+    ! output=$(lxc config set storage.images_volume "${pool}/foo" 2>&1) || false
+    [[ "${output}" == "Error: Failed validation of \"storage.images_volume\": Remote storage pool \"${pool}\" cannot be used" ]]
 
     return
   fi
@@ -142,15 +155,21 @@ _server_config_storage() {
   lxc storage volume create "${pool}" images
 
   # Validate errors
-  ! lxc config set storage.backups_volume foo/bar || false
-  ! lxc config set storage.images_volume foo/bar || false
-  ! lxc config set storage.backups_volume "${pool}/bar" || false
-  ! lxc config set storage.images_volume "${pool}/bar" || false
+  ! output=$(lxc config set storage.backups_volume foo/bar 2>&1) || false
+  [[ "${output}" == *"Storage pool not found" ]]
+  ! output=$(lxc config set storage.images_volume foo/bar 2>&1) || false
+  [[ "${output}" == *"Storage pool not found" ]]
+  ! output=$(lxc config set storage.backups_volume "${pool}/bar" 2>&1) || false
+  [[ "${output}" == *"Storage volume not found" ]]
+  ! output=$(lxc config set storage.images_volume "${pool}/bar" 2>&1) || false
+  [[ "${output}" == *"Storage volume not found" ]]
 
   lxc storage volume snapshot "${pool}" backups
   lxc storage volume snapshot "${pool}" images
-  ! lxc config set storage.backups_volume "${pool}/backups" || false
-  ! lxc config set storage.images_volume "${pool}/images" || false
+  ! output=$(lxc config set storage.backups_volume "${pool}/backups" 2>&1) || false
+  [[ "${output}" == *"Storage volumes for use by LXD itself cannot have snapshots" ]]
+  ! output=$(lxc config set storage.images_volume "${pool}/images" 2>&1) || false
+  [[ "${output}" == *"Storage volumes for use by LXD itself cannot have snapshots" ]]
 
   lxc storage volume delete "${pool}" backups/snap0
   lxc storage volume delete "${pool}" images/snap0
@@ -184,12 +203,18 @@ _server_config_storage() {
   fi
 
   # Validate more errors
-  ! lxc storage volume delete "${pool}" backups || false
-  ! lxc storage volume delete "${pool}" images || false
-  ! lxc storage volume rename "${pool}" backups backups1 || false
-  ! lxc storage volume rename "${pool}" images images1 || false
-  ! lxc storage volume snapshot "${pool}" backups || false
-  ! lxc storage volume snapshot "${pool}" images || false
+  ! output=$(lxc storage volume delete "${pool}" backups 2>&1) || false
+  [[ "${output}" == *"Error: The storage volume is still in use" ]]
+  ! output=$(lxc storage volume delete "${pool}" images 2>&1) || false
+  [[ "${output}" == *"Error: The storage volume is still in use" ]]
+  ! output=$(lxc storage volume rename "${pool}" backups backups1 2>&1) || false
+  [[ "${output}" == *"Error: Volume is used by LXD itself and cannot be renamed" ]]
+  ! output=$(lxc storage volume rename "${pool}" images images1 2>&1) || false
+  [[ "${output}" == *"Error: Volume is used by LXD itself and cannot be renamed" ]]
+  ! output=$(lxc storage volume snapshot "${pool}" backups 2>&1) || false
+  [[ "${output}" == *"Error: Volumes used by LXD itself cannot have snapshots" ]]
+  ! output=$(lxc storage volume snapshot "${pool}" images 2>&1) || false
+  [[ "${output}" == *"Error: Volumes used by LXD itself cannot have snapshots" ]]
 
   # Modify container and publish to image on custom volume.
   lxc start foo
@@ -230,7 +255,7 @@ _server_config_storage() {
   fi
 
   # Cleanup
-  lxc delete -f foo
+  lxc delete foo
 }
 
 _server_config_user_microcloud() {

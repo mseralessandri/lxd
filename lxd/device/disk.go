@@ -210,14 +210,7 @@ func (d *disk) validateConfig(instConf instance.ConfigReader) error {
 	// Supported propagation types.
 	// If an empty value is supplied the default behavior is to assume "private" mode.
 	// These come from https://www.kernel.org/doc/Documentation/filesystems/sharedsubtree.txt
-	propagationTypes := []string{"", "private", "shared", "slave", "unbindable", "rshared", "rslave", "runbindable", "rprivate"}
-	validatePropagation := func(input string) error {
-		if !slices.Contains(propagationTypes, d.config["bind"]) {
-			return fmt.Errorf("Invalid propagation value. Must be one of: %s", strings.Join(propagationTypes, ", "))
-		}
-
-		return nil
-	}
+	propagationTypes := []string{"private", "shared", "slave", "unbindable", "rshared", "rslave", "runbindable", "rprivate"}
 
 	rules := map[string]func(string) error{
 		// lxdmeta:generate(entities=device-disk; group=device-conf; key=required)
@@ -226,7 +219,7 @@ func (d *disk) validateConfig(instConf instance.ConfigReader) error {
 		//  type: bool
 		//  defaultdesc: `true`
 		//  required: no
-		//  shortdesc: Whether to fail if the source doesn’t exist
+		//  shortdesc: Whether to fail instance start if the source doesn’t exist
 		"required": validate.Optional(validate.IsBool),
 		"optional": validate.Optional(validate.IsBool), // "optional" is deprecated, replaced by "required".
 		// lxdmeta:generate(entities=device-disk; group=device-conf; key=readonly)
@@ -246,12 +239,12 @@ func (d *disk) validateConfig(instConf instance.ConfigReader) error {
 		//  shortdesc: Whether to recursively mount the source path
 		"recursive": validate.Optional(validate.IsBool),
 		// lxdmeta:generate(entities=device-disk; group=device-conf; key=shift)
-		// If enabled, this option sets up a shifting overlay to translate the source UID/GID to match the container instance.
+		// For containers, if enabled, this option sets up a shifting overlay to translate the source UID/GID to match the instance.
+		// For virtual machines, the source UID/GID is passed through unchanged, even if the instance `raw.idmap` is set.
 		// ---
 		//  type: bool
 		//  defaultdesc: `false`
 		//  required: no
-		//  condition: container
 		//  shortdesc: Whether to set up a UID/GID shifting overlay
 		"shift": validate.Optional(validate.IsBool),
 		// lxdmeta:generate(entities=device-disk; group=device-conf; key=source)
@@ -339,7 +332,7 @@ func (d *disk) validateConfig(instConf instance.ConfigReader) error {
 		//  defaultdesc: `private`
 		//  required: no
 		//  shortdesc: How a bind-mount is shared between the instance and the host
-		"propagation": validatePropagation,
+		"propagation": validate.Optional(validate.IsOneOf(propagationTypes...)),
 		// lxdmeta:generate(entities=device-disk; group=device-conf; key=raw.mount.options)
 		//
 		// ---
@@ -692,7 +685,7 @@ func (d *disk) validateEnvironmentSourcePath() error {
 	instProject := d.inst.Project()
 	if instProject.Name != api.ProjectDefaultName {
 		// If restricted disk paths are in force, then check the disk's source is allowed, and record the
-		// allowed parent path for later user during device start up sequence.
+		// allowed parent path for later use during device start up sequence.
 		if shared.IsTrue(instProject.Config["restricted"]) && instProject.Config["restricted.devices.disk.paths"] != "" {
 			allowed, restrictedParentSourcePath := project.CheckRestrictedDevicesDiskPaths(instProject.Config, d.config["source"])
 			if !allowed {
@@ -1180,6 +1173,16 @@ func (d *disk) startVM() (*deviceConfig.RunConfig, error) {
 					mount.FSType = "iso9660"
 				}
 
+				if shared.IsTrue(dbVolume.Config["security.shifted"]) {
+					// To be consistent with containers, we use the OwnerShift
+					// flag here even though it means something different for
+					// VMs. Containers use ID-mapped mounts because it makes
+					// UIDs and GIDs look the same on the host and in the
+					// VM. For VMs, the same effect is achieved by using an
+					// identity mapping for virtiofsd's nested user namespace.
+					mount.OwnerShift = deviceConfig.MountOwnerShiftDynamic
+				}
+
 				revertFunc, mountedPath, _, err := d.mountPoolVolume()
 				if err != nil {
 					return nil, diskSourceNotFoundError{msg: "Failed mounting volume", err: err}
@@ -1203,7 +1206,7 @@ func (d *disk) startVM() (*deviceConfig.RunConfig, error) {
 
 					clusterName := config["ceph.cluster_name"]
 					if clusterName == "" {
-						clusterName = storageDrivers.CephDefaultUser
+						clusterName = storageDrivers.CephDefaultCluster
 					}
 
 					contentType := storagePools.VolumeDBContentTypeToContentType(dbContentType)
@@ -1240,6 +1243,10 @@ func (d *disk) startVM() (*deviceConfig.RunConfig, error) {
 					return nil, errors.New(`Missing mount "path" setting`)
 				}
 
+				if shared.IsTrue(d.config["shift"]) {
+					mount.OwnerShift = deviceConfig.MountOwnerShiftDynamic
+				}
+
 				// Mount the source in the instance devices directory.
 				// This will ensure that if the exported directory configured as readonly that this
 				// takes effect event if using virtio-fs (which doesn't support read only mode) by
@@ -1257,9 +1264,20 @@ func (d *disk) startVM() (*deviceConfig.RunConfig, error) {
 				mount.TargetPath = d.config["path"]
 				mount.FSType = "virtiofs"
 
-				rawIDMaps, err := idmap.ParseRawIdmap(d.inst.ExpandedConfig()["raw.idmap"])
-				if err != nil {
-					return nil, fmt.Errorf(`Failed parsing instance "raw.idmap": %w`, err)
+				// When security.shifted=true, the volume's files are owned by real users on the
+				// host (e.g. UID 0 not 1000000). For containers, the mount needs to be shifted to
+				// counteract the effect of entering a user namespace. But VMs don't use user
+				// namespaces, so we actually don't want to shift the virtiofsd process.
+				//
+				// Also, we should ignore raw.idmap for consistency with containers. If I create a
+				// file as user 1000 inside the container, the file on disk is owned by UID 1000.
+				// We don't care that container user is actually 1001000 in the root namespace.
+				var rawIDMaps []idmap.IdmapEntry
+				if mount.OwnerShift != deviceConfig.MountOwnerShiftDynamic {
+					rawIDMaps, err = idmap.ParseRawIdmap(d.inst.ExpandedConfig()["raw.idmap"])
+					if err != nil {
+						return nil, fmt.Errorf(`Failed parsing instance "raw.idmap": %w`, err)
+					}
 				}
 
 				// If we are using restricted parent source path mode, or if a non-empty set of
@@ -1288,16 +1306,12 @@ func (d *disk) startVM() (*deviceConfig.RunConfig, error) {
 					logPath := filepath.Join(d.inst.LogPath(), "disk."+filesystem.PathNameEncode(d.name)+".log")
 					_ = os.Remove(logPath) // Remove old log if needed.
 
-					revertFunc, unixListener, err := DiskVMVirtiofsdStart(d.inst, sockPath, pidPath, logPath, mountedPath, rawIDMaps, virtiofsdThreadPoolSize)
+					revertFunc, err := DiskVMVirtiofsdStart(d.inst, sockPath, pidPath, logPath, mountedPath, rawIDMaps, virtiofsdThreadPoolSize)
 					if err != nil {
 						return err
 					}
 
 					revert.Add(revertFunc)
-					runConf.Revert = func() { _ = unixListener.Close() }
-
-					// Request the unix listener is closed after QEMU has connected on startup.
-					runConf.PostHooks = append(runConf.PostHooks, unixListener.Close)
 
 					// Resolve previous warning
 					_ = warnings.ResolveWarningsByLocalNodeAndProjectAndType(d.state.DB.Cluster, d.inst.Project().Name, warningtype.MissingVirtiofsd)
@@ -1326,7 +1340,7 @@ func (d *disk) startVM() (*deviceConfig.RunConfig, error) {
 
 				// Detect ISO files to set correct FSType.
 				// This is very important to support Windows ISO images (amongst other).
-				if strings.HasSuffix(pathSource.Path, ".iso") {
+				if strings.HasSuffix(strings.ToLower(pathSource.Path), ".iso") {
 					mount.FSType = "iso9660"
 				}
 

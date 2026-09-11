@@ -40,6 +40,7 @@ readonly test_group_cluster=(
     "clustering_upgrade"
     "clustering_upgrade_large"
     "clustering_downgrade"
+    "clustering_durable_operations"
     "clustering_groups"
     "clustering_events"
     "clustering_uuid"
@@ -53,6 +54,8 @@ readonly test_group_cluster=(
     "clustering_link_info"
     "clustering_image_proxy_bypass"
     "clustering_link_unidirectional"
+    "clustering_link_public"
+    "clustering_acme"
 )
 
 readonly test_group_cluster_storage=(
@@ -78,7 +81,7 @@ readonly test_group_replicator_storage=(
 
 readonly test_group_instance=(
     "cloud_init"
-    "concurrent"  # Disabled as flaky.
+    "concurrent"
     "concurrent_exec"
     "console"
     "console_vm"
@@ -107,6 +110,8 @@ readonly test_group_image=(
     "image_import_dir"
     "image_import_url"
     "image_import_existing_alias"
+    "image_import_metadata"
+    "image_import_metadata_not_regular_file"
     "image_list_all_aliases"
     "image_list_all_projects"
     "image_list_remotes"
@@ -166,9 +171,13 @@ readonly test_group_standalone=(
     "duplicate_detection"
     "fdleak"
     "filtering"
+    "bulk_operation_children"
     "get_operations"
     "operations_conflict_reference"
     "instances_selective_recursion"
+    "image_backup_confined"
+    "image_metadata_confined"
+    "image_metadata_template_target_confined"
     "kernel_limits"
     "loki"
     "loki_security_forwarding"
@@ -246,6 +255,7 @@ readonly test_group_standalone_storage=(
     "devlxd_volume_management_ownership"
     "devlxd_volume_management_snapshots"
     "filemanip"
+    "filemanip_concurrent_copy"
     "filemanip_req_content_type"
     "fuidshift"
     "idmap"
@@ -287,6 +297,7 @@ readonly test_group_standalone_storage=(
     "storage_driver_dir"
     "storage_driver_zfs"
     "storage_driver_pure"
+    "storage_pools"
     "storage_buckets"
     "storage_volume_import"
     "storage_volume_initial_config"

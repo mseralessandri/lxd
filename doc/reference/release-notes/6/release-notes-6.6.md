@@ -263,6 +263,7 @@ Endpoints converted to asynchronous behavior:
 
 These features are removed in this release.
 
+(ref-release-notes-6.6-deprecated-instance-scriptlet)=
 ### Instance placement scriptlet removed
 
 The instance placement scriptlet functionality (and the associated `instances_placement_scriptlet` API extension) has been removed in favor of the new {ref}`exp-clusters-placement` functionality.
@@ -297,5 +298,5 @@ The source tarballs and binary clients can be found on our [download page](https
 Binary packages are also available for:
 
 - **Linux:** `snap install lxd --channel=6/stable`
-- **MacOS client:** `brew install lxc`
+- **macOS client:** `brew install lxc`
 - **Windows client:** `choco install lxc`

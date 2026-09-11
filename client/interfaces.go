@@ -190,6 +190,16 @@ type InstanceServer interface {
 	GetImagesAllProjects() (images []api.Image, err error)
 	GetImagesAllProjectsWithFilter(filters []string) (images []api.Image, err error)
 
+	// Image registry functions ("image_registries" API extension)
+	GetImageRegistry(name string) (imageRegistry *api.ImageRegistry, ETag string, err error)
+	GetImageRegistryNames() (names []string, err error)
+	GetImageRegistryImages(name string) (images []api.Image, err error)
+	GetImageRegistries() (imageRegistries []api.ImageRegistry, err error)
+	CreateImageRegistry(imageRegistry api.ImageRegistriesPost) (op Operation, err error)
+	UpdateImageRegistry(name string, imageRegistry api.ImageRegistryPut, ETag string) (op Operation, err error)
+	RenameImageRegistry(name string, imageRegistry api.ImageRegistryPost) (op Operation, err error)
+	DeleteImageRegistry(name string) (op Operation, err error)
+
 	// Network functions ("network" API extension)
 	GetNetworkNames() (names []string, err error)
 	GetNetworks() (networks []api.Network, err error)
@@ -267,6 +277,7 @@ type InstanceServer interface {
 	GetOperations() (operations []api.Operation, err error)
 	GetOperationsAllProjects() (operations []api.Operation, err error)
 	GetOperation(uuid string) (op *api.Operation, ETag string, err error)
+	GetOperationFull(uuid string) (op *api.OperationFull, ETag string, err error)
 	GetOperationWait(uuid string, timeout int) (op *api.Operation, ETag string, err error)
 	GetOperationWaitSecret(uuid string, secret string, timeout int) (op *api.Operation, ETag string, err error)
 	GetOperationWebsocket(uuid string, secret string) (conn *websocket.Conn, err error)
@@ -388,6 +399,7 @@ type InstanceServer interface {
 	GetClusterLinkState(name string) (clusterLinkState *api.ClusterLinkState, ETag string, err error)
 	CreateClusterLink(clusterLink api.ClusterLinksPost) (err error)
 	CreateIdentityClusterLinkToken(clusterLink api.ClusterLinksPost) (certificateAddToken *api.CertificateAddToken, err error)
+	CreateClusterLinkPendingPublic(clusterLink api.ClusterLinksPost) (clusterLinkCertificate *api.ClusterLinkCertificate, err error)
 	UpdateClusterLink(name string, clusterLink api.ClusterLinkPut, ETag string) (err error)
 	RenameClusterLink(name string, clusterLink api.ClusterLinkPost) (err error)
 	DeleteClusterLink(name string) (err error)
@@ -631,6 +643,11 @@ type ImageCopyArgs struct {
 
 	// List of profiles to apply on the target.
 	Profiles []string
+
+	// Source image registry to use.
+	//
+	// API extension: image_registries
+	ImageRegistry string
 }
 
 // The StoragePoolVolumeCopyArgs struct is used to pass additional options

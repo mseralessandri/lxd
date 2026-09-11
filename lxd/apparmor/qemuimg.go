@@ -29,9 +29,11 @@ profile "{{ .name }}" flags=(attach_disconnected,mediate_deleted) {
   capability dac_read_search,
   capability ipc_lock,
 
+  # qemu-img probes for CAP_SYS_ADMIN but works fine without it; deny silently to avoid audit noise.
+  deny capability sys_admin,
+
   @{PROC}/sys/vm/max_map_count r,
-  /sys/devices/**/block/*/queue/max_segments  r,
-  /sys/devices/**/block/*/queue/zoned  r,
+  /sys/devices/**/block/*/queue/* r,
   /sys/devices/system/node/ r,
   /sys/devices/system/node/** r,
 
@@ -77,7 +79,11 @@ func (w writerFunc) Write(b []byte) (n int, err error) {
 func handleWriter(out io.Writer, hand func(int64, int64, int64)) io.Writer {
 	var current int64
 	return writerFunc(func(b []byte) (int, error) {
-		n, _ := out.Write(b)
+		n, err := out.Write(b)
+		if err != nil {
+			return n, err
+		}
+
 		numStr, _, _ := strings.Cut(strings.Trim(string(b), "(%) \t\n\v\f\r"), "/")
 		f, err := strconv.ParseFloat(numStr, 64)
 		if err != nil {

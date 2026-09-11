@@ -483,6 +483,19 @@ definitions:
         title: ClusterLink represents high-level information about a cluster link.
         type: object
         x-go-package: github.com/canonical/lxd/shared/api
+    ClusterLinkCertificate:
+        description: |-
+            It is returned when creating a pending public cluster link, and its fingerprint must be submitted
+            back as ClusterLinksPost.Fingerprint to confirm and pin the certificate.
+        properties:
+            fingerprint:
+                description: SHA-256 fingerprint of the certificate.
+                example: a1b2c3d4..
+                type: string
+                x-go-name: Fingerprint
+        title: ClusterLinkCertificate represents a remote cluster certificate fetched for user verification.
+        type: object
+        x-go-package: github.com/canonical/lxd/shared/api
     ClusterLinkMemberState:
         properties:
             address:
@@ -578,11 +591,30 @@ definitions:
                 example: Linked cluster
                 type: string
                 x-go-name: Description
+            fingerprint:
+                description: |-
+                    Fingerprint of the remote cluster's certificate, echoed back to confirm a pending public
+                    cluster link. It must match the fingerprint returned when the pending link was created; the
+                    certificate itself is not resubmitted, as the server pins the copy it already holds.
+                    API extension: cluster_links_public.
+                example: a1b2c3d4..
+                type: string
+                x-go-name: Fingerprint
             name:
                 description: Name of the cluster.
                 example: lxd02
                 type: string
                 x-go-name: Name
+            remote_address:
+                description: |-
+                    RemoteAddress is the address of the remote cluster, used for public links. It is the address
+                    contacted when creating a pending public cluster link, and is required for that request only.
+                    Confirming the link pins the address recorded when the pending link was created, so the link
+                    always points at the address that was verified; setting this field on a confirm request is
+                    rejected.
+                example: 10.0.0.1:8443
+                type: string
+                x-go-name: RemoteAddress
             trust_token:
                 description: |-
                     TrustToken for creating a cluster link. This is included in requests to create an active cluster link on the local cluster and activate a pending cluster link on the linked cluster.
@@ -1083,6 +1115,17 @@ definitions:
                 example: tls
                 type: string
                 x-go-name: AuthenticationMethod
+            expires_at:
+                description: |-
+                    ExpiresAt is the expiration time of the credential belonging to the identity. For TLS identities this is the
+                    expiry of the certificate, and for bearer identities it is the expiry of the most recently issued token.
+                    It is unset for identities whose credential has no expiry, that have no credential yet (pending identities),
+                    or whose token has been revoked.
+
+                    API extension: access_management_expiry.
+                format: date-time
+                type: string
+                x-go-name: ExpiresAt
             groups:
                 description: Groups is the list of groups for which the identity is a member.
                 example:
@@ -1177,8 +1220,12 @@ definitions:
                 x-go-name: EffectivePermissions
             expires_at:
                 description: |-
-                    ExpiresAt is the expiration time of the credential used to authenticate the caller.
-                    It is set only when client is trusted, and authentication method is either bearer or TLS.
+                    ExpiresAt is the expiration time of the credential belonging to the identity. For TLS identities this is the
+                    expiry of the certificate, and for bearer identities it is the expiry of the most recently issued token.
+                    It is unset for identities whose credential has no expiry, that have no credential yet (pending identities),
+                    or whose token has been revoked.
+
+                    API extension: access_management_expiry.
                 format: date-time
                 type: string
                 x-go-name: ExpiresAt
@@ -1723,6 +1770,109 @@ definitions:
                 x-go-name: Public
         type: object
         x-go-package: github.com/canonical/lxd/shared/api
+    ImageRegistriesPost:
+        properties:
+            config:
+                additionalProperties:
+                    type: string
+                description: Image registry configuration map
+                example:
+                    user.*: ""
+                type: object
+                x-go-name: Config
+            description:
+                description: Description of the image registry
+                example: My new image registry
+                type: string
+                x-go-name: Description
+            name:
+                description: Registry name
+                example: ubuntu
+                type: string
+                x-go-name: Name
+            protocol:
+                description: Protocol used by the image registry ("SimpleStreams" or "LXD")
+                example: simplestreams
+                type: string
+                x-go-name: Protocol
+        title: ImageRegistriesPost represents the fields of a new image registry.
+        type: object
+        x-go-package: github.com/canonical/lxd/shared/api
+    ImageRegistry:
+        properties:
+            access_entitlements:
+                description: AccessEntitlements represents the entitlements that are granted to the requesting user on the attached entity.
+                example:
+                    - can_view
+                    - can_edit
+                items:
+                    type: string
+                type: array
+                x-go-name: AccessEntitlements
+            builtin:
+                description: Whether the image registry is built-in
+                example: false
+                type: boolean
+                x-go-name: Builtin
+            config:
+                additionalProperties:
+                    type: string
+                description: Image registry configuration map
+                example:
+                    user.*: ""
+                type: object
+                x-go-name: Config
+            description:
+                description: Description of the image registry
+                example: My new image registry
+                type: string
+                x-go-name: Description
+            name:
+                description: Registry name
+                example: ubuntu
+                type: string
+                x-go-name: Name
+            protocol:
+                description: Protocol used by the image registry ("SimpleStreams" or "LXD")
+                example: simplestreams
+                type: string
+                x-go-name: Protocol
+            public:
+                description: Whether the image registry is public
+                example: true
+                type: boolean
+                x-go-name: Public
+        title: ImageRegistry is used to display an image registry.
+        type: object
+        x-go-package: github.com/canonical/lxd/shared/api
+    ImageRegistryPost:
+        properties:
+            name:
+                description: New name for the image registry
+                example: bar
+                type: string
+                x-go-name: Name
+        title: ImageRegistryPost represents the fields required to rename the image registry.
+        type: object
+        x-go-package: github.com/canonical/lxd/shared/api
+    ImageRegistryPut:
+        properties:
+            config:
+                additionalProperties:
+                    type: string
+                description: Image registry configuration map
+                example:
+                    user.*: ""
+                type: object
+                x-go-name: Config
+            description:
+                description: Description of the image registry
+                example: My new image registry
+                type: string
+                x-go-name: Description
+        title: ImageRegistryPut represents the modifiable fields of an image registry.
+        type: object
+        x-go-package: github.com/canonical/lxd/shared/api
     ImageSource:
         description: ImageSource represents the source of a LXD image
         properties:
@@ -1736,6 +1886,14 @@ definitions:
                 example: X509 PEM certificate
                 type: string
                 x-go-name: Certificate
+            image_registry:
+                description: |-
+                    Image registry name
+
+                    API extension: image_registries
+                example: ubuntu
+                type: string
+                x-go-name: ImageRegistry
             image_type:
                 description: |-
                     Type of image (container or virtual-machine)
@@ -1841,11 +1999,27 @@ definitions:
                 example: X509 PEM certificate
                 type: string
                 x-go-name: Certificate
+            copy_aliases:
+                description: |-
+                    Whether to copy aliases from the source image
+
+                    API extension: image_registries
+                example: true
+                type: boolean
+                x-go-name: CopyAliases
             fingerprint:
                 description: Source image fingerprint (for type "image")
                 example: 8ae945c52bb2f2df51c923b04022312f99bbb72c356251f54fa89ea7cf1df1d0
                 type: string
                 x-go-name: Fingerprint
+            image_registry:
+                description: |-
+                    Image registry name
+
+                    API extension: image_registries
+                example: ubuntu
+                type: string
+                x-go-name: ImageRegistry
             image_type:
                 description: |-
                     Type of image (container or virtual-machine)
@@ -2982,6 +3156,14 @@ definitions:
                 example: ed56997f7c5b48e8d78986d2467a26109be6fb9f2d92e8c7b08eb8b6cec7629a
                 type: string
                 x-go-name: Fingerprint
+            image_registry:
+                description: |-
+                    Image registry name
+
+                    API extension: image_registries
+                example: ubuntu
+                type: string
+                x-go-name: ImageRegistry
             instance_only:
                 description: Whether the copy should skip the snapshots (for copy)
                 example: false
@@ -5031,6 +5213,15 @@ definitions:
     Operation:
         description: Operation represents a LXD background operation
         properties:
+            child_count:
+                description: |-
+                    Number of child operations.
+
+                    API extension: operation_child_count
+                example: 2
+                format: int64
+                type: integer
+                x-go-name: ChildCount
             class:
                 description: Type of operation (task, token or websocket)
                 example: websocket
@@ -5128,6 +5319,15 @@ definitions:
         x-go-package: github.com/canonical/lxd/shared/api
     OperationFull:
         properties:
+            child_count:
+                description: |-
+                    Number of child operations.
+
+                    API extension: operation_child_count
+                example: 2
+                format: int64
+                type: integer
+                x-go-name: ChildCount
             children:
                 description: Children is a list of child operations, if any exist.
                 items:
@@ -9009,7 +9209,7 @@ paths:
             tags:
                 - identities
     /1.0/auth/identities/bearer/{nameOrID}/token:
-        post:
+        delete:
             consumes:
                 - application/json
             description: Revokes any existing token for the identity.
@@ -9024,6 +9224,52 @@ paths:
                 "500":
                     $ref: '#/responses/InternalServerError'
             summary: Revoke a bearer identity token.
+            tags:
+                - identities
+        post:
+            consumes:
+                - application/json
+            description: Issues a new token for the bearer identity and revokes any existing token.
+            operationId: identity_post_bearer_token
+            parameters:
+                - description: Parameters of token creation
+                  in: body
+                  name: Token request
+                  required: true
+                  schema:
+                    $ref: '#/definitions/IdentityBearerTokenPost'
+            produces:
+                - application/json
+            responses:
+                "200":
+                    description: API endpoints
+                    schema:
+                        description: Sync response
+                        properties:
+                            metadata:
+                                $ref: '#/definitions/IdentityBearerToken'
+                            status:
+                                description: Status description
+                                example: Success
+                                type: string
+                            status_code:
+                                description: Status code
+                                example: 200
+                                type: integer
+                            type:
+                                description: Response type
+                                example: sync
+                                type: string
+                        type: object
+                "400":
+                    $ref: '#/responses/BadRequest'
+                "403":
+                    $ref: '#/responses/Forbidden'
+                "404":
+                    $ref: '#/responses/NotFound'
+                "500":
+                    $ref: '#/responses/InternalServerError'
+            summary: Issue a token for a bearer identity.
             tags:
                 - identities
     /1.0/auth/identities/bearer/{nameOrIdentifier}:

@@ -99,15 +99,74 @@ test_authorization() {
   lxc auth group permission remove test-group project default can_view
   lxc network rm n1
 
+  ### BUILT-IN ADMINS GROUP ###
+  admins_group="admins"
+  admins_url="/1.0/auth/groups/${admins_group}"
+  server_admin_permission='{"entity_type": "server", "url": "/1.0", "entitlement": "admin"}'
+  project_operator_permission='{"entity_type": "project", "url": "/1.0/projects/default", "entitlement": "operator"}'
+
+  sub_test "The admins group is seeded with the server admin permission and is immutable"
+  lxc query "${admins_url}" | jq --exit-status ".permissions == [${server_admin_permission}]"
+  [ "$("${_LXC}" query -X POST "${admins_url}" -d '{"name": "not-admins"}' 2>&1 >/dev/null)" = 'Error: The admins group cannot be renamed' ]
+  [ "$("${_LXC}" query -X DELETE "${admins_url}" 2>&1 >/dev/null)" = 'Error: The admins group cannot be deleted' ]
+
+  # Even a no-op update is rejected while the group holds the server admin permission.
+  [ "$("${_LXC}" query -X PUT "${admins_url}" -d "{\"permissions\": [${server_admin_permission}]}" 2>&1 >/dev/null)" = 'Error: The admins group cannot be modified' ]
+  [ "$("${_LXC}" query -X PUT "${admins_url}" -d "{\"description\": \"Not allowed\", \"permissions\": [${server_admin_permission}]}" 2>&1 >/dev/null)" = 'Error: The admins group cannot be modified' ]
+  [ "$("${_LXC}" query -X PATCH "${admins_url}" -d "{\"permissions\": [${project_operator_permission}]}" 2>&1 >/dev/null)" = 'Error: The admins group cannot be modified' ]
+  lxc query "${admins_url}" | jq --exit-status ".permissions == [${server_admin_permission}]"
+
+  sub_test "The admins group can be granted the server admin permission if it does not have it"
+  # Simulate an installation that was upgraded from a LXD version that did not seed the admins group permissions.
+  lxd sql global "DELETE FROM auth_groups_permissions WHERE auth_group_id = (SELECT id FROM auth_groups WHERE name = '${admins_group}')"
+  lxc query "${admins_url}" | jq --exit-status '.permissions == []'
+
+  # Only the server admin permission (and nothing else) may be granted.
+  [ "$("${_LXC}" query -X PUT "${admins_url}" -d '{"permissions": []}' 2>&1 >/dev/null)" = 'Error: The admins group can only be granted the server admin permission' ]
+  [ "$("${_LXC}" query -X PUT "${admins_url}" -d "{\"permissions\": [${project_operator_permission}]}" 2>&1 >/dev/null)" = 'Error: The admins group can only be granted the server admin permission' ]
+  [ "$("${_LXC}" query -X PUT "${admins_url}" -d "{\"permissions\": [${server_admin_permission}, ${project_operator_permission}]}" 2>&1 >/dev/null)" = 'Error: The admins group can only be granted the server admin permission' ]
+  [ "$("${_LXC}" query -X PATCH "${admins_url}" -d "{\"permissions\": [${project_operator_permission}]}" 2>&1 >/dev/null)" = 'Error: The admins group can only be granted the server admin permission' ]
+  lxc query "${admins_url}" | jq --exit-status '.permissions == []'
+
+  # PATCH with exactly the server admin permission is allowed, and makes the group immutable again.
+  lxc query -X PATCH "${admins_url}" -d "{\"permissions\": [${server_admin_permission}]}"
+  lxc query "${admins_url}" | jq --exit-status ".permissions == [${server_admin_permission}]"
+  [ "$("${_LXC}" query -X PATCH "${admins_url}" -d "{\"permissions\": [${server_admin_permission}]}" 2>&1 >/dev/null)" = 'Error: The admins group cannot be modified' ]
+
+  # PUT with exactly the server admin permission is allowed too.
+  lxd sql global "DELETE FROM auth_groups_permissions WHERE auth_group_id = (SELECT id FROM auth_groups WHERE name = '${admins_group}')"
+  lxc query -X PUT "${admins_url}" -d "{\"permissions\": [${server_admin_permission}]}"
+  lxc query "${admins_url}" | jq --exit-status ".permissions == [${server_admin_permission}]"
+  [ "$("${_LXC}" query -X PUT "${admins_url}" -d "{\"permissions\": [${server_admin_permission}]}" 2>&1 >/dev/null)" = 'Error: The admins group cannot be modified' ]
+
+  sub_test "The admins group can only be created with no permissions or the server admin permission"
+  # Simulate an installation that was upgraded from a LXD version that predates the built-in admins group.
+  lxd sql global "PRAGMA foreign_keys=ON; DELETE FROM auth_groups WHERE name = '${admins_group}'"
+  [ "$("${_LXC}" query -X POST /1.0/auth/groups -d "{\"name\": \"${admins_group}\", \"permissions\": [${project_operator_permission}]}" 2>&1 >/dev/null)" = 'Error: The admins group can only be granted the server admin permission' ]
+  [ "$("${_LXC}" query -X POST /1.0/auth/groups -d "{\"name\": \"${admins_group}\", \"permissions\": [${server_admin_permission}, ${project_operator_permission}]}" 2>&1 >/dev/null)" = 'Error: The admins group can only be granted the server admin permission' ]
+
+  # Creating the group without permissions is allowed, it can then be granted the server admin permission.
+  lxc auth group create "${admins_group}"
+  lxc query "${admins_url}" | jq --exit-status '.permissions == []'
+  lxc query -X PUT "${admins_url}" -d "{\"permissions\": [${server_admin_permission}]}"
+  lxc query "${admins_url}" | jq --exit-status ".permissions == [${server_admin_permission}]"
+
+  # Creating the group with exactly the server admin permission is allowed.
+  lxd sql global "PRAGMA foreign_keys=ON; DELETE FROM auth_groups WHERE name = '${admins_group}'"
+  lxc query -X POST /1.0/auth/groups -d "{\"name\": \"${admins_group}\", \"description\": \"Server administrators\", \"permissions\": [${server_admin_permission}]}"
+  lxc query "${admins_url}" | jq --exit-status ".permissions == [${server_admin_permission}]"
+  lxc query "${admins_url}" | jq --exit-status '.description == "Server administrators"'
+
   ### IDENTITY MANAGEMENT ###
   lxc config trust show "${tls_user_fingerprint}"
   ! lxc auth identity group add "tls/${tls_user_fingerprint}" test-group || false # TLS identities cannot be added to groups (yet).
 
   spawn_oidc
-  lxc config set "oidc.issuer=http://127.0.0.1:$(< "${TEST_DIR}/oidc.port")/" "oidc.client.id=device"
+  oidc_issuer="http://127.0.0.1:$(< "${TEST_DIR}/oidc.port")/"
+  lxc config set "oidc.issuer=${oidc_issuer}" "oidc.client.id=device"
 
   set_oidc test-user test-user@example.com
-  BROWSER=curl lxc remote add --accept-certificate oidc "${LXD_ADDR}" --auth-type oidc
+  lxc remote add --accept-certificate oidc "${LXD_ADDR}" --auth-type oidc
 
   ! lxc auth identity group add oidc/test-user@example.com not-found || false # Group not found
   [ "$(my_curl -X PUT -H 'Content-Type: application/json' --data '{"groups":["test-group","not-found1","not-found2"]}' "https://${LXD_ADDR}/1.0/auth/identities/oidc/test-user@example.com" | jq --exit-status --raw-output '.error')" = 'One or more groups were not found: "not-found1", "not-found2"' ] # Groups not found error (only contains the groups that were not found).
@@ -212,6 +271,10 @@ fine_grained: true"
   certExpiresAt="$(printf '%s\n' "${currentIdentity}" | sed -n 's/^expires_at: //p')"
   [[ "${certExpiresAt}" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]]
 
+  # The certificate expiry is derived from the presented peer certificate for the current identity, but from the
+  # stored certificate when the identity is shown. Both describe the same certificate, so their expiry must match.
+  [ "$(date -u -d "$(lxc query "/1.0/auth/identities/tls/${tls_identity_fingerprint}" | jq --exit-status --raw-output '.expires_at')" +%s)" = "$(date -u -d "${certExpiresAt}" +%s)" ]
+
   expectedBearerInfo="authentication_method: bearer
 type: Client token bearer
 id: ${bearer_identity_id}
@@ -256,7 +319,9 @@ fine_grained: true"
   lxc auth identity delete tls/tmp
 
   lxc auth identity create devlxd/tmp
-  devlxd_identity_id="$(lxc auth identity list --format csv | grep -F 'DevLXD token bearer' | cut -d, -f4)"
+  # A newly created DevLXD bearer identity is pending until a token is issued.
+  [ "$(lxc auth identity show devlxd/tmp | sed -n 's/^type: //p')" = "DevLXD token bearer (pending)" ]
+  devlxd_identity_id="$(lxc auth identity show devlxd/tmp | grep "^id:" | cut -d' ' -f2)"
   ! lxc auth group permission add test-group identity "${devlxd_identity_id}" can_view || false # Missing authentication method
   lxc auth group permission add test-group identity "devlxd/${devlxd_identity_id}" can_view # Valid
   lxc auth group permission remove test-group identity "devlxd/${devlxd_identity_id}" can_view
@@ -275,7 +340,33 @@ fine_grained: true"
   # Use curl instead of lxc to ensure API interaction is correct.
   lxc auth identity create bearer/tmp
   tmp_bearer_identity_id="$(lxc auth identity show bearer/tmp | grep "^id:" | cut -d' ' -f2)"
+
+  # A bearer identity with no issued token is pending and has no expiry to report.
+  [ "$(lxc auth identity show bearer/tmp | sed -n 's/^type: //p')" = "Client token bearer (pending)" ]
+  lxc query "/1.0/auth/identities/bearer/${tmp_bearer_identity_id}" | jq --exit-status '.expires_at == null'
+
+  # Pruning expired tokens must not remove a pending bearer identity, which holds no token and is waiting for one
+  # to be issued, unlike a pending TLS identity whose token secret expires.
+  lxc query --request POST /internal/testing/prune-tokens
+  [ "$(lxc auth identity show bearer/tmp | sed -n 's/^type: //p')" = "Client token bearer (pending)" ]
+
   tmp_bearer_identity_token="$(lxc auth identity token issue bearer/tmp --quiet)"
+
+  # Issuing a token promotes the identity from pending to its active type.
+  [ "$(lxc auth identity show bearer/tmp | sed -n 's/^type: //p')" = "Client token bearer" ]
+
+  # Once a token is issued, the identity reports its expiry when shown, not only via the current identity endpoint.
+  # The reported expiry must match the "exp" claim of the issued token exactly, so that the identity and the token
+  # it was issued cannot describe different expiries.
+  tmp_bearer_token_payload="$(printf '%s' "${tmp_bearer_identity_token}" | cut -d. -f2 | base64 -d 2>/dev/null || true)"
+  tmp_bearer_token_exp="$(jq --exit-status --raw-output '.exp' <<< "${tmp_bearer_token_payload}")"
+  tmp_bearer_listed_expiry="$(lxc query "/1.0/auth/identities/bearer/${tmp_bearer_identity_id}" | jq --exit-status --raw-output '.expires_at')"
+  [ "$(date -u -d "${tmp_bearer_listed_expiry}" +%s)" = "${tmp_bearer_token_exp}" ]
+
+  # The expiry is also reported when listing identities recursively.
+  tmp_bearer_recursive_expiry="$(lxc query "/1.0/auth/identities/bearer?recursion=1" | jq --exit-status --raw-output --arg id "${tmp_bearer_identity_id}" '.[] | select(.id == $id) | .expires_at')"
+  [ "$(date -u -d "${tmp_bearer_recursive_expiry}" +%s)" = "${tmp_bearer_token_exp}" ]
+
   curl -s -k -H "Authorization: Bearer ${tmp_bearer_identity_token}" "https://${LXD_ADDR}/1.0" | jq --exit-status '.metadata.auth == "trusted"'
   curl -s -k -H "Authorization: Bearer ${tmp_bearer_identity_token}" "https://${LXD_ADDR}/1.0" | jq --exit-status '.metadata.auth_user_method == "bearer"'
   curl -s -k -H "Authorization: Bearer ${tmp_bearer_identity_token}" "https://${LXD_ADDR}/1.0" | jq --exit-status --arg id "${tmp_bearer_identity_id}" '.metadata.auth_user_name == $id'
@@ -283,11 +374,23 @@ fine_grained: true"
   # Check that bearer token revocation works.
   lxc auth identity token revoke bearer/tmp
   curl -s -k -H "Authorization: Bearer ${tmp_bearer_identity_token}" "https://${LXD_ADDR}/1.0" | jq --exit-status '.error_code == 403'
+
+  # Revoking the token demotes the identity back to its pending type and clears the reported expiry, so that a
+  # revoked token is not advertised as still valid.
+  [ "$(lxc auth identity show bearer/tmp | sed -n 's/^type: //p')" = "Client token bearer (pending)" ]
+  lxc query "/1.0/auth/identities/bearer/${tmp_bearer_identity_id}" | jq --exit-status '.expires_at == null'
+
+  # An identity that was demoted to pending by a revocation must also survive token pruning.
+  lxc query --request POST /internal/testing/prune-tokens
+  [ "$(lxc auth identity show bearer/tmp | sed -n 's/^type: //p')" = "Client token bearer (pending)" ]
+
   lxc auth identity delete bearer/tmp
 
   # Ensure DevLXD token cannot be to authenticate with main LXD API.
   lxc auth identity create devlxd/tmp
   devlxd_identity_token="$(lxc auth identity token issue devlxd/tmp --quiet)"
+  # Issuing a token promotes the DevLXD identity to its active type.
+  [ "$(lxc auth identity show devlxd/tmp | sed -n 's/^type: //p')" = "DevLXD token bearer" ]
   curl -s -k -H "Authorization: Bearer ${devlxd_identity_token}" "https://${LXD_ADDR}/1.0" | jq --exit-status '.error_code == 403'
   lxc auth identity delete devlxd/tmp
 
@@ -447,9 +550,9 @@ fine_grained: true"
 
   # As an admin
   ! lxc query -X PUT /1.0/auth/identities/bearer/test-bearer -d "{\"tls_certificate\":\"${user6_cert}\",\"name\":\" \",\"identifier\":\"test-user@example.com\"}" || false
-  [ "$("${_LXC}" query -X PUT /1.0/auth/identities/bearer/test-bearer -d "{\"tls_certificate\":\"${user6_cert}\",\"name\":\" \",\"identifier\":\"test-user@example.com\"}"  2>&1 >/dev/null)" = 'Error: Cannot update certificate for identities of type "DevLXD token bearer"' ]
+  [ "$("${_LXC}" query -X PUT /1.0/auth/identities/bearer/test-bearer -d "{\"tls_certificate\":\"${user6_cert}\",\"name\":\" \",\"identifier\":\"test-user@example.com\"}"  2>&1 >/dev/null)" = 'Error: Cannot update certificate for identities of type "DevLXD token bearer (pending)"' ]
   ! lxc query -X PATCH /1.0/auth/identities/bearer/test-bearer -d "{\"tls_certificate\":\"${user6_cert}\"}" || false
-  [ "$("${_LXC}" query -X PATCH /1.0/auth/identities/bearer/test-bearer -d "{\"tls_certificate\":\"${user6_cert}\"}" 2>&1 >/dev/null)" = 'Error: Cannot update certificate for identities of type "DevLXD token bearer"' ]
+  [ "$("${_LXC}" query -X PATCH /1.0/auth/identities/bearer/test-bearer -d "{\"tls_certificate\":\"${user6_cert}\"}" 2>&1 >/dev/null)" = 'Error: Cannot update certificate for identities of type "DevLXD token bearer (pending)"' ]
   ! lxc query -X PUT /1.0/auth/identities/oidc/test-user@example.com -d "{\"tls_certificate\":\"${user6_cert}\",\"name\":\" \",\"identifier\":\"test-user@example.com\"}" || false
   [ "$("${_LXC}" query -X PUT /1.0/auth/identities/oidc/test-user@example.com -d "{\"tls_certificate\":\"${user6_cert}\",\"name\":\" \",\"identifier\":\"test-user@example.com\"}"  2>&1 >/dev/null)" = 'Error: Cannot update certificate for identities of type "OIDC client"' ]
   ! lxc query -X PATCH /1.0/auth/identities/oidc/test-user@example.com -d "{\"tls_certificate\":\"${user6_cert}\"}" || false
@@ -495,9 +598,8 @@ events_filtering() {
 
   # Monitor as fine-grained identity with no permissions.
   lxc remote switch tls
-  lxc monitor --all-projects --format json > "${monfile}" &
-  monitor_pid=$!
-  sleep 0.1
+  lxc_monitor_start "${monfile}" --all-projects --format json
+  monitor_pid="${LXC_MONITOR_PID}"
   lxc remote switch local
 
   # Create an image via unix socket, then kill the monitor process.
@@ -513,9 +615,8 @@ events_filtering() {
   lxc auth group permission add test-group project default can_view
   lxc auth group permission add test-group project default can_view_events
   lxc remote switch tls
-  lxc monitor --all-projects --format json > "${monfile}" &
-  monitor_pid=$!
-  sleep 0.1
+  lxc_monitor_start "${monfile}" --all-projects --format json
+  monitor_pid="${LXC_MONITOR_PID}"
   lxc remote switch local
 
   # Create a profile via unix socket, then kill the monitor process.
@@ -532,9 +633,8 @@ events_filtering() {
   # Monitor as fine-grained identity that creates the profile with minimal permissions.
   lxc auth group permission add test-group project default can_create_profiles
   lxc remote switch tls
-  lxc monitor --all-projects --format json > "${monfile}" &
-  monitor_pid=$!
-  sleep 0.1
+  lxc_monitor_start "${monfile}" --all-projects --format json
+  monitor_pid="${LXC_MONITOR_PID}"
   lxc remote switch local
 
   # Create a profile via the fine-grained identity, without view permissions.
@@ -791,11 +891,11 @@ fine_grained_authorization() {
 
   lxc auth group permission remove test-group server can_view_warnings
 
-  # Check we are not able to view any server config currently.
+  # Check we are only able to view public configuration.
   # Here we explicitly a setting that contains an actual password.
   lxc config set loki.auth.password bar
-  lxc_remote query "${remote}:/1.0" | jq --exit-status '.config == null'
-  lxc_remote query "${remote}:/1.0" | jq --exit-status '.config."loki.auth.password" == null'
+  lxc_remote query "${remote}:/1.0" | jq --exit-status '.config."oidc.issuer" == "'"${oidc_issuer}"'" and .config."oidc.device.client.id" == "device" and (.config | length) == 2'
+  curl -k "https://${LXD_ADDR}/1.0" | jq --exit-status '.metadata | .config."oidc.issuer" == "'"${oidc_issuer}"'" and .config."oidc.device.client.id" == "device" and (.config | length) == 2'
 
   # Check we are not able to set any server config currently.
   ! lxc_remote config set "${remote}:" loki.auth.password bar2 || false
@@ -1074,7 +1174,7 @@ auth_project_features() {
   # Validate restricted caller cannot see resources in projects they do not have access to.
   ! lxc_remote list "${remote}:" --project default --format csv || false
   ! lxc_remote profile list "${remote}:" --project default --format csv || false
-  [ "$(lxc_remote profile list "${remote}:" --all-projects --format csv || echo fail)" = "" ]
+  [ "$(lxc_remote profile list "${remote}:" --all-projects --format csv)" = "blah,default,Default LXD profile for project blah,0" ]
   ! lxc_remote network list "${remote}:" --project default --format csv || false
   ! lxc_remote operation list "${remote}:" --project default --format csv || false
   ! lxc_remote network zone list "${remote}:" --project default --format csv || false
@@ -1170,8 +1270,14 @@ auth_project_features() {
   # Delete it anyway to test that we can import a new one.
   lxc image delete "${test_image_fingerprint}" --project default
 
-  # Members of test-group can create images.
+  # Members of test-group cannot create images unless they have can_create_images in the default project.
+  ! lxc_remote image import "${TEST_DIR}/${test_image_fingerprint}.tar"* "${remote}:" --project blah || false
+  lxc auth group permission add test-group project default can_create_images
   lxc_remote image import "${TEST_DIR}/${test_image_fingerprint}.tar"* "${remote}:" --project blah
+
+  # Members of test-group cannot create image aliases unless they have can_create_image_aliases in the default project.
+  ! lxc_remote image alias create "${remote}:testimage" "${test_image_fingerprint}" --project blah || false
+  lxc auth group permission add test-group project default can_create_image_aliases
   lxc_remote image alias create "${remote}:testimage" "${test_image_fingerprint}" --project blah
 
   # We can view the image we've created via project blah (whose effective project is default) because we've granted the
@@ -1182,6 +1288,8 @@ auth_project_features() {
   # Image clean up
   lxc image delete "${test_image_fingerprint}" --project default
   lxc auth group permission remove test-group project default can_view_images
+  lxc auth group permission remove test-group project default can_create_images
+  lxc auth group permission remove test-group project default can_create_image_aliases
   lxc auth group permission remove test-group project default can_view
   rm "${TEST_DIR}/${test_image_fingerprint}.tar"*
 
@@ -1217,7 +1325,9 @@ auth_project_features() {
   # Members of test-group cannot delete the network.
   ! lxc_remote network delete "${remote}:${networkName}" --project blah || false
 
-  # Create a network in the blah project.
+  # Members of test-group cannot create networks unless they have can_create_networks in the default project
+  ! lxc_remote network create "${remote}:blah-network" --project blah ipv4.address=none ipv6.address=none || false
+  lxc auth group permission add test-group project default can_create_networks
   lxc_remote network create "${remote}:blah-network" --project blah ipv4.address=none ipv6.address=none
 
   # The network is visible only because we have granted view access on networks in the default project.
@@ -1237,6 +1347,7 @@ auth_project_features() {
   lxc network delete "${networkName}" --project blah
   lxc network delete blah-network --project blah
   lxc auth group permission remove test-group project default can_view_networks
+  lxc auth group permission remove test-group project default can_create_networks
   lxc auth group permission remove test-group project default can_view
 
   ### NETWORK ZONES (initial value is false in new projects).
@@ -1267,7 +1378,9 @@ auth_project_features() {
   # Members of test-group can delete the network zone.
   ! lxc_remote network zone delete "${remote}:${zoneName}" --project blah || false
 
-  # Create a network zone in the blah project.
+  # Members of test-group cannot create network zones unless they have can_create_network_zones in the default project.
+  ! lxc_remote network zone create "${remote}:blah-zone" --project blah || false
+  lxc auth group permission add test-group project default can_create_network_zones
   lxc_remote network zone create "${remote}:blah-zone" --project blah
 
   # Network zone is visible to members of test-group in project blah (because they can view network zones in the default project).
@@ -1284,6 +1397,7 @@ auth_project_features() {
   lxc network zone delete "${zoneName}" --project blah
   lxc network zone delete blah-zone --project blah
   lxc auth group permission remove test-group project default can_view_network_zones
+  lxc auth group permission remove test-group project default can_create_network_zones
   lxc auth group permission remove test-group project default can_view
 
   ### Network allocations
@@ -1362,7 +1476,9 @@ auth_project_features() {
   # Members of test-group cannot delete the profile.
   ! lxc_remote profile delete "${remote}:${profileName}" --project blah || false
 
-  # Create a profile in the blah project.
+  # Members of test-group cannot create profiles unless they have can_create_profiles in the default project
+  ! lxc_remote profile create "${remote}:blah-profile" --project blah || false
+  lxc auth group permission add test-group project default can_create_profiles
   lxc_remote profile create "${remote}:blah-profile" --project blah
 
   # Profile is visible to members of test-group in project blah and project default.
@@ -1378,6 +1494,7 @@ auth_project_features() {
   lxc profile delete "${profileName}" --project blah
   lxc profile delete blah-profile --project blah
   lxc auth group permission remove test-group project default can_view_profiles
+  lxc auth group permission remove test-group project default can_create_profiles
   lxc auth group permission remove test-group project default can_view
 
   ### STORAGE VOLUMES (initial value is true for new projects)
@@ -1409,7 +1526,9 @@ auth_project_features() {
   # Members of test-group cannot delete the storage volume.
   ! lxc_remote storage volume delete "${remote}:${pool_name}" "${volName}" --project blah || false
 
-  # Create a storage volume in the blah project.
+  # Members of test-group cannot create storage volumes unless they have can_create_storage_volumes in the default project
+  ! lxc_remote storage volume create "${remote}:${pool_name}" blah-volume --project blah || false
+  lxc auth group permission add test-group project default can_create_storage_volumes
   lxc_remote storage volume create "${remote}:${pool_name}" blah-volume --project blah
 
   # Storage volume is visible to members of test-group in project blah (because they can view volumes in the default project).
@@ -1425,6 +1544,7 @@ auth_project_features() {
   lxc storage volume delete "${pool_name}" "${volName}"
   lxc storage volume delete "${pool_name}" blah-volume
   lxc auth group permission remove test-group project default can_view_storage_volumes
+  lxc auth group permission remove test-group project default can_create_storage_volumes
   lxc auth group permission remove test-group project default can_view
 
   ### STORAGE BUCKETS (initial value is true for new projects)
@@ -1460,7 +1580,9 @@ auth_project_features() {
     # Members of test-group cannot delete the storage bucket.
     ! lxc_remote storage bucket delete "${remote}:s3" "${bucketName}" --project blah || false
 
-    # Create a storage bucket in the blah project.
+    # Members of test-group cannot create storage buckets unless they have can_create_storage_buckets in the default project
+    ! lxc_remote storage bucket create "${remote}:s3" blah-bucket --project blah || false
+    lxc auth group permission add test-group project default can_create_storage_buckets
     lxc_remote storage bucket create "${remote}:s3" blah-bucket --project blah
 
     # Storage bucket is visible to members of test-group in project blah (because they can view buckets in the default project).
@@ -1475,6 +1597,7 @@ auth_project_features() {
     lxc storage bucket delete s3 blah-bucket --project blah
     lxc storage bucket delete s3 "${bucketName}" --project blah
     lxc auth group permission remove test-group project default can_view_storage_buckets
+    lxc auth group permission remove test-group project default can_create_storage_buckets
     lxc auth group permission remove test-group project default can_view
     delete_object_storage_pool s3
   fi
@@ -1874,6 +1997,9 @@ test_ui_initial_access_link() {
   echo "==> Test initial UI access link"
   lxd init --ui-initial-access-link
 
+  # Issuing the initial UI token promotes the identity from pending to its active type.
+  [ "$(lxc auth identity show bearer/ui-admin-initial | sed -n 's/^type: //p')" = "Initial UI token bearer" ]
+
   # Regenerate while identity already exists.
   lxd init --ui-initial-access-link
 
@@ -1977,6 +2103,10 @@ test_ui_initial_access_link() {
 
   echo "==> Testing revoked token access"
   lxc auth identity token revoke bearer/ui-admin-initial
+
+  # Revoking the token demotes the identity back to its pending type.
+  [ "$(lxc auth identity show bearer/ui-admin-initial | sed -n 's/^type: //p')" = "Initial UI token bearer (pending)" ]
+
   loginOutput=$(curl -s -k -i -H "User-Agent: Mozilla" "${url}")
 
   if grep -q "token_bearer_session=" <<< "${loginOutput}"; then
@@ -1992,6 +2122,10 @@ test_ui_initial_access_link() {
 
   # Ensure access is forbidden when using the revoked token.
   curl -s -k -H "User-Agent: Mozilla" -H "Cookie: token_bearer_session=${cookie}" "https://${LXD_ADDR}/1.0/auth/identities/current" | jq --exit-status '.error_code == 403'
+
+  # Regenerate while the identity is pending, which is the state a revoked token leaves it in.
+  lxd init --ui-initial-access-link
+  [ "$(lxc auth identity show bearer/ui-admin-initial | sed -n 's/^type: //p')" = "Initial UI token bearer" ]
 
   # Cleanup.
   lxc auth identity delete bearer/ui-admin-initial

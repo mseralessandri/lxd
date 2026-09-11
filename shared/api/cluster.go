@@ -14,7 +14,25 @@ const (
 	//
 	// API extension: cluster_links_unidirectional.
 	ClusterLinkTypeUnidirectional = "unidirectional"
+
+	// ClusterLinkTypePublic indicates that only the local cluster can use the link and no client certificate is presented.
+	//
+	// API extension: cluster_links_public.
+	ClusterLinkTypePublic = "public"
 )
+
+// ClusterLinkTypePresentsClientCertificate reports whether a cluster link of the given type presents
+// a client certificate when connecting to the remote cluster, which is what allows the remote to
+// authenticate the connection. Types are matched explicitly so that an unrecognised type is reported
+// as not presenting one rather than being assumed to.
+func ClusterLinkTypePresentsClientCertificate(clusterLinkType string) bool {
+	switch clusterLinkType {
+	case ClusterLinkTypeBidirectional, ClusterLinkTypeUnidirectional:
+		return true
+	}
+
+	return false
+}
 
 // Cluster represents high-level information about a LXD cluster.
 //
@@ -514,6 +532,34 @@ type ClusterLinksPost struct {
 	// The certificate (X509 PEM encoded) for the linked cluster. This is included in server-side POST requests to activate the pending cluster link on the linked cluster that generated the trust token.
 	// Example: X509 PEM certificate
 	ClusterCertificate string `json:"cluster_certificate" yaml:"cluster_certificate"`
+
+	// Fingerprint of the remote cluster's certificate, echoed back to confirm a pending public
+	// cluster link. It must match the fingerprint returned when the pending link was created; the
+	// certificate itself is not resubmitted, as the server pins the copy it already holds.
+	// Example: a1b2c3d4...
+	// API extension: cluster_links_public.
+	Fingerprint string `json:"fingerprint,omitempty" yaml:"fingerprint,omitempty"`
+
+	// RemoteAddress is the address of the remote cluster, used for public links. It is the address
+	// contacted when creating a pending public cluster link, and is required for that request only.
+	// Confirming the link pins the address recorded when the pending link was created, so the link
+	// always points at the address that was verified; setting this field on a confirm request is
+	// rejected.
+	// Example: 10.0.0.1:8443
+	RemoteAddress string `json:"remote_address,omitempty" yaml:"remote_address,omitempty"`
+}
+
+// ClusterLinkCertificate represents a remote cluster certificate fetched for user verification.
+// It is returned when creating a pending public cluster link, and its fingerprint must be submitted
+// back as ClusterLinksPost.Fingerprint to confirm and pin the certificate.
+//
+// swagger:model
+//
+// API extension: cluster_links_public.
+type ClusterLinkCertificate struct {
+	// SHA-256 fingerprint of the certificate.
+	// Example: a1b2c3d4...
+	Fingerprint string `json:"fingerprint" yaml:"fingerprint"`
 }
 
 // ClusterLinkPost represents the fields available for renaming a cluster link.

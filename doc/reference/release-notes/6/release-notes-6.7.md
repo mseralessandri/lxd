@@ -342,6 +342,7 @@ However these  client functions are made to be backward compatible with older LX
 
 These features are removed in this release.
 
+(ref-release-notes-6.7-deprecated-vm-9p)=
 ### VM 9p filesystem support for custom disk devices removed
 
 Due to the change to QEMU 10.2 (which removed virtfs-proxy-helper support) LXD no longer supports exporting custom filesystem disk devices to VM guest using the 9p protocol. Custom filesystem disk devices can now only be exported to the VM guest using the virtiofs protocol.
@@ -377,5 +378,5 @@ The source tarballs and binary clients can be found on our [download page](https
 Binary packages are also available for:
 
 - **Linux:** `snap install lxd --channel=6/stable`
-- **MacOS client:** `brew install lxc`
+- **macOS client:** `brew install lxc`
 - **Windows client:** `choco install lxc`

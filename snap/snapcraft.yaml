@@ -42,6 +42,7 @@ description: |-
    - daemon.syslog: Send LXD log events to syslog [default=false]
    - daemon.verbose: Increase logging to verbose level [default=false]
    - db.trace: Enable dqlite trace logging (very verbose) [default=false]
+   - features: Enable feature previews that are still work-in-progress. Never use in production [default=none]
    - lvm.external: Use the system's LVM tools [default=false]
    - lxcfs.loadavg: Start tracking per-container load average [default=false]
    - lxcfs.cfs: Consider CPU shares for CPU usage [default=false]
@@ -269,16 +270,16 @@ parts:
       usr/bin/: bin/
       usr/lib/: lib/
     override-stage: |-
-      [ "$(uname -m)" = "armv7l" ] && exit 0
+      [ "${CRAFT_TARGET_ARCH}" = "armhf" ] && exit 0
       craftctl default
     override-prime: |-
-      [ "$(uname -m)" = "armv7l" ] && exit 0
+      [ "${CRAFT_TARGET_ARCH}" = "armhf" ] && exit 0
       craftctl default
     override-pull: |-
-      [ "$(uname -m)" = "armv7l" ] && exit 0
+      [ "${CRAFT_TARGET_ARCH}" = "armhf" ] && exit 0
       craftctl default
     override-build: |-
-      [ "$(uname -m)" = "armv7l" ] && exit 0
+      [ "${CRAFT_TARGET_ARCH}" = "armhf" ] && exit 0
       craftctl default
     prime:
       - bin/ceph
@@ -438,20 +439,29 @@ parts:
         - rsync
         - uuid-dev
     override-stage: |-
-      [ "$(uname -m)" != "x86_64" ] && [ "$(uname -m)" != "aarch64" ] && [ "$(uname -m)" != "riscv64" ]  && exit 0
+      case "${CRAFT_TARGET_ARCH}" in
+          amd64|arm64|riscv64) ;;
+          *) exit 0 ;;
+      esac
       craftctl default
     override-prime: |-
-      [ "$(uname -m)" != "x86_64" ] && [ "$(uname -m)" != "aarch64" ] && [ "$(uname -m)" != "riscv64" ]  && exit 0
+      case "${CRAFT_TARGET_ARCH}" in
+          amd64|arm64|riscv64) ;;
+          *) exit 0 ;;
+      esac
       craftctl default
     override-pull: |-
-      [ "$(uname -m)" != "x86_64" ] && [ "$(uname -m)" != "aarch64" ] && [ "$(uname -m)" != "riscv64" ]  && exit 0
+      case "${CRAFT_TARGET_ARCH}" in
+          amd64|arm64|riscv64) ;;
+          *) exit 0 ;;
+      esac
       craftctl default
     override-build: |-
-      [ "$(uname -m)" != "x86_64" ] && [ "$(uname -m)" != "aarch64" ] && [ "$(uname -m)" != "riscv64" ]  && exit 0
+      case "${CRAFT_TARGET_ARCH}" in
+          amd64|arm64|riscv64) ;;
+          *) exit 0 ;;
+      esac
       set -eux
-
-      # Ensure staged libraries are found (needed for qemu to generate secure boot vars)
-      export LD_LIBRARY_PATH="${CRAFT_STAGE}/lib/$(dpkg-architecture -qDEB_HOST_MULTIARCH):${CRAFT_STAGE}/lib:${LD_LIBRARY_PATH:-}"
 
       # Apply patches from Ubuntu sources.
       QUILT_PATCHES=debian/patches quilt push -a
@@ -480,13 +490,18 @@ parts:
       # Install files destination
       mkdir -p "${CRAFT_PART_INSTALL}/share/qemu/"
 
-      if [ "$(uname -m)" = "x86_64" ]; then
+      if [ "${CRAFT_TARGET_ARCH}" = "amd64" ]; then
           DSC="OvmfPkg/OvmfPkgX64.dsc"
-          BUILD_TARGET="install-ovmf"
+          BUILD_TARGETS="install-ovmf-secboot install-ovmf-no-secboot"
           SRC_DIR="debian/tmp/usr/share/OVMF"
-          SRC_CODE="OVMF_CODE_4M.secboot.fd"
+          SRC_CODE="OVMF_CODE_4M.ms.fd"
+          SRC_CODE_NOSB="OVMF_CODE_4M.fd"
           SRC_VARS="OVMF_VARS_4M.fd"
           SRC_VARS_MS="OVMF_VARS_4M.ms.fd"
+          DST_CODE="OVMF_CODE_4M.ms"
+          DST_CODE_NOSB="OVMF_CODE_4M"
+          DST_VARS="OVMF_VARS_4M"
+          DST_VARS_MS="OVMF_VARS_4M.ms"
           # Add DEBUG_VERBOSE to print error level for DEBUG build
           # * 0x80000000 (DEBUG_ERROR)
           # * 0x00000040 (DEBUG_INFO)
@@ -494,22 +509,35 @@ parts:
           # = 0x8000004F
           # Adding 0x00400000 (DEBUG_VERBOSE) gives 0x8040004F
           SED_EXPR="s#PcdDebugPrintErrorLevel|0x8000004F#PcdDebugPrintErrorLevel|0x8040004F#g"
-      elif [ "$(uname -m)" = "aarch64" ]; then
+      elif [ "${CRAFT_TARGET_ARCH}" = "arm64" ]; then
           DSC="ArmVirtPkg/ArmVirt.dsc.inc"
-          BUILD_TARGET="install-qemu-efi-aarch64"
+          BUILD_TARGETS="install-qemu-efi-aarch64-secboot install-qemu-efi-aarch64-no-secboot"
           SRC_DIR="debian/tmp/usr/share/AAVMF"
-          SRC_CODE="AAVMF_CODE.secboot.fd"
+          SRC_CODE="AAVMF_CODE.ms.fd"
+          # XXX: The package doesn't create AAVMF_CODE.fd for this
+          # non-secureboot variant, but we need a consistent name for the snap,
+          # so we copy it from the .no-secboot.fd file.
+          SRC_CODE_NOSB="AAVMF_CODE.no-secboot.fd"
           SRC_VARS="AAVMF_VARS.fd"
           SRC_VARS_MS="AAVMF_VARS.ms.fd"
+          DST_CODE="AAVMF_CODE.ms"
+          DST_CODE_NOSB="AAVMF_CODE"
+          DST_VARS="AAVMF_VARS"
+          DST_VARS_MS="AAVMF_VARS.ms"
           # See note in `x86_64` section for DEBUG_VERBOSE explanation
           SED_EXPR="s#DEBUG_PRINT_ERROR_LEVEL = 0x8000004F#DEBUG_PRINT_ERROR_LEVEL = 0x8040004F#g"
-      elif [ "$(uname -m)" = "riscv64" ]; then
+      elif [ "${CRAFT_TARGET_ARCH}" = "riscv64" ]; then
           DSC="OvmfPkg/RiscVVirt/RiscVVirtQemu.dsc"
-          BUILD_TARGET="install-qemu-efi-riscv64"
+          BUILD_TARGETS="install-qemu-efi-riscv64"
           SRC_DIR="debian/tmp/usr/share/qemu-efi-riscv64"
-          SRC_CODE="RISCV_VIRT_CODE.fd"
+          SRC_CODE=""
+          SRC_CODE_NOSB="RISCV_VIRT_CODE.fd"
           SRC_VARS="RISCV_VIRT_VARS.fd"
-          SRC_VARS_MS="RISCV_VIRT_VARS.fd"
+          SRC_VARS_MS=""
+          DST_CODE=""
+          DST_CODE_NOSB="RISCV_VIRT_CODE"
+          DST_VARS="RISCV_VIRT_VARS"
+          DST_VARS_MS=""
           # See note in `x86_64` section for DEBUG_VERBOSE explanation
           SED_EXPR="s#DEBUG_PRINT_ERROR_LEVEL = 0x8000004F#DEBUG_PRINT_ERROR_LEVEL = 0x8040004F#g"
       fi
@@ -531,17 +559,23 @@ parts:
 
           # Enable parallel builds to avoid lengthy build times due to LTO. amd64 build on LP goes from ~1h45m -> ~60m
           # lto-wrapper: note: see the ‘-flto’ option documentation for more information
-          /usr/bin/make -j$(nproc) -f debian/rules "${BUILD_TARGET}" BUILD_TYPE="${TYPE}"
+          # BUILD_TARGETS holds one or more space-separated make goals, so it must stay
+          # unquoted here to be word-split into separate targets.
+          # shellcheck disable=SC2086
+          /usr/bin/make -j$(nproc) -f debian/rules ${BUILD_TARGETS} BUILD_TYPE="${TYPE}"
 
           if [ "${TYPE}" = "DEBUG" ] && [ -f "${DSC}.bak" ]; then
               mv "${DSC}.bak" "${DSC}"
           fi
 
-          cp "${SRC_DIR}/${SRC_CODE}" "${CRAFT_PART_INSTALL}/share/qemu/OVMF_CODE.4MB${SUFFIX}.fd"
-          cp "${SRC_DIR}/${SRC_VARS}" "${CRAFT_PART_INSTALL}/share/qemu/OVMF_VARS.4MB${SUFFIX}.fd"
+          if [ -n "${SRC_CODE}" ] && [ -n "${DST_CODE}" ]; then
+              cp "${SRC_DIR}/${SRC_CODE}" "${CRAFT_PART_INSTALL}/share/qemu/${DST_CODE}${SUFFIX}.fd"
+          fi
+          cp "${SRC_DIR}/${SRC_CODE_NOSB}" "${CRAFT_PART_INSTALL}/share/qemu/${DST_CODE_NOSB}${SUFFIX}.fd"
+          cp "${SRC_DIR}/${SRC_VARS}" "${CRAFT_PART_INSTALL}/share/qemu/${DST_VARS}${SUFFIX}.fd"
 
-          if [ "${TYPE}" = "RELEASE" ]; then
-               cp "${SRC_DIR}/${SRC_VARS_MS}" "${CRAFT_PART_INSTALL}/share/qemu/OVMF_VARS.4MB.ms.fd"
+          if [ "${TYPE}" = "RELEASE" ] && [ -n "${SRC_VARS_MS}" ] && [ -n "${DST_VARS_MS}" ]; then
+               cp "${SRC_DIR}/${SRC_VARS_MS}" "${CRAFT_PART_INSTALL}/share/qemu/${DST_VARS_MS}.fd"
           fi
       }
 
@@ -549,23 +583,29 @@ parts:
       run_build RELEASE ""
 
       # RISC-V build is already very slow and adding a DEBUG build makes it even slower, so skip it.
-      if [ "$(uname -m)" != "riscv64" ]; then
+      if [ "${CRAFT_TARGET_ARCH}" != "riscv64" ]; then
         # Build Debug (silence the copious build output to avoid doubling it)
         run_build DEBUG ".debug" > /dev/null
       fi
 
       # Cleanup debug vars
-      rm -f "${CRAFT_PART_INSTALL}/share/qemu/OVMF_VARS.4MB.debug.fd"
+      rm -f "${CRAFT_PART_INSTALL}/share/qemu/${DST_VARS}.debug.fd"
     prime:
       - share/qemu/*
 
   libatomic:
     plugin: nil
     override-stage: |-
-      [ "$(uname -m)" != "riscv64" ] && [ "$(uname -m)" != "s390x" ] && exit 0
+      case "${CRAFT_TARGET_ARCH}" in
+          riscv64|s390x) ;;
+          *) exit 0 ;;
+      esac
       craftctl default
     override-prime: |-
-      [ "$(uname -m)" != "riscv64" ] && [ "$(uname -m)" != "s390x" ] && exit 0
+      case "${CRAFT_TARGET_ARCH}" in
+          riscv64|s390x) ;;
+          *) exit 0 ;;
+      esac
       craftctl default
     stage-packages:
       - to riscv64:
@@ -657,12 +697,12 @@ parts:
 
   nvidia-container:
     source: https://github.com/NVIDIA/libnvidia-container
-    source-commit: 7585946c6471402577e14474d7c56ca5be0348d7 # v1.19.1
+    source-commit: 3e428194f8616a81e16834d27365e4a663668533 # v1.20.0
     source-depth: 1
     source-type: git
     plugin: make
     build-environment:
-      - GIT_TAG: "1.19.1" # Enables source-depth: 1, should match git tag without "v" prefix.
+      - GIT_TAG: "1.20.0" # Enables source-depth: 1, should match git tag without "v" prefix.
     build-packages:
       - to amd64:
         - bmake
@@ -681,16 +721,28 @@ parts:
     build-snaps:
       - go/1.26/stable
     override-stage: |-
-      [ "$(uname -m)" != "x86_64" ] && [ "$(uname -m)" != "aarch64" ] && exit 0
+      case "${CRAFT_TARGET_ARCH}" in
+          amd64|arm64) ;;
+          *) exit 0 ;;
+      esac
       craftctl default
     override-prime: |-
-      [ "$(uname -m)" != "x86_64" ] && [ "$(uname -m)" != "aarch64" ] && exit 0
+      case "${CRAFT_TARGET_ARCH}" in
+          amd64|arm64) ;;
+          *) exit 0 ;;
+      esac
       craftctl default
     override-pull: |-
-      [ "$(uname -m)" != "x86_64" ] && [ "$(uname -m)" != "aarch64" ] && exit 0
+      case "${CRAFT_TARGET_ARCH}" in
+          amd64|arm64) ;;
+          *) exit 0 ;;
+      esac
       craftctl default
     override-build: |-
-      [ "$(uname -m)" != "x86_64" ] && [ "$(uname -m)" != "aarch64" ] && exit 0
+      case "${CRAFT_TARGET_ARCH}" in
+          amd64|arm64) ;;
+          *) exit 0 ;;
+      esac
       set -ex
 
       # Setup build environment
@@ -705,7 +757,7 @@ parts:
       patch -p1 < "${CRAFT_PROJECT_DIR}/patches/nvidia-0002-pre-load-libdl.patch"
 
       mkdir -p "${CRAFT_PART_INSTALL}/bin/"
-      cp "${CRAFT_PROJECT_DIR}/snapcraft/wrappers/nvidia-container-cli" "${CRAFT_PART_INSTALL}/bin/"
+      cp "${CRAFT_PROJECT_DIR}/snap/local/wrappers/nvidia-container-cli" "${CRAFT_PART_INSTALL}/bin/"
 
       set +ex
       craftctl default
@@ -720,26 +772,26 @@ parts:
   nvidia-container-toolkit:
     source: https://github.com/NVIDIA/nvidia-container-toolkit
     source-depth: 1
-    source-commit: 09ceee5dde66ba9ce25c7cc69b1ebd5e6e3266fa # v1.19.1
+    source-commit: 5505e2f94d9aaa08561490db974ba3cd676af209 # v1.20.0
     source-type: git
     build-snaps:
       - go/1.26/stable
     plugin: make
     override-stage: |-
-      [ "$(uname -m)" = "armv7l" ] && exit 0
-      [ "$(uname -m)" = "riscv64" ] && exit 0
+      [ "${CRAFT_TARGET_ARCH}" = "armhf" ] && exit 0
+      [ "${CRAFT_TARGET_ARCH}" = "riscv64" ] && exit 0
       craftctl default
     override-prime: |-
-      [ "$(uname -m)" = "armv7l" ] && exit 0
-      [ "$(uname -m)" = "riscv64" ] && exit 0
+      [ "${CRAFT_TARGET_ARCH}" = "armhf" ] && exit 0
+      [ "${CRAFT_TARGET_ARCH}" = "riscv64" ] && exit 0
       craftctl default
     override-pull: |-
-      [ "$(uname -m)" = "armv7l" ] && exit 0
-      [ "$(uname -m)" = "riscv64" ] && exit 0
+      [ "${CRAFT_TARGET_ARCH}" = "armhf" ] && exit 0
+      [ "${CRAFT_TARGET_ARCH}" = "riscv64" ] && exit 0
       craftctl default
     override-build: |-
-      [ "$(uname -m)" = "armv7l" ] && exit 0
-      [ "$(uname -m)" = "riscv64" ] && exit 0
+      [ "${CRAFT_TARGET_ARCH}" = "armhf" ] && exit 0
+      [ "${CRAFT_TARGET_ARCH}" = "riscv64" ] && exit 0
       set -ex
 
       # Setup build environment
@@ -772,18 +824,17 @@ parts:
       - else:
         - openvswitch-common
         - openvswitch-switch
-        - libunbound8        # workaround for https://github.com/canonical/core-base/issues/443
     override-stage: |-
-      [ "$(uname -m)" = "armv7l" ] && exit 0
+      [ "${CRAFT_TARGET_ARCH}" = "armhf" ] && exit 0
       craftctl default
     override-prime: |-
-      [ "$(uname -m)" = "armv7l" ] && exit 0
+      [ "${CRAFT_TARGET_ARCH}" = "armhf" ] && exit 0
       craftctl default
     override-pull: |-
-      [ "$(uname -m)" = "armv7l" ] && exit 0
+      [ "${CRAFT_TARGET_ARCH}" = "armhf" ] && exit 0
       craftctl default
     override-build: |-
-      [ "$(uname -m)" = "armv7l" ] && exit 0
+      [ "${CRAFT_TARGET_ARCH}" = "armhf" ] && exit 0
       craftctl default
     organize:
       usr/bin/: bin/
@@ -802,19 +853,17 @@ parts:
       - to armhf: []
       - else:
         - ovn-common
-        - libevent-2.1-7t64  # workaround for https://github.com/canonical/core-base/issues/443
-        - libunbound8        # workaround for https://github.com/canonical/core-base/issues/443
     override-stage: |-
-      [ "$(uname -m)" = "armv7l" ] && exit 0
+      [ "${CRAFT_TARGET_ARCH}" = "armhf" ] && exit 0
       craftctl default
     override-prime: |-
-      [ "$(uname -m)" = "armv7l" ] && exit 0
+      [ "${CRAFT_TARGET_ARCH}" = "armhf" ] && exit 0
       craftctl default
     override-pull: |-
-      [ "$(uname -m)" = "armv7l" ] && exit 0
+      [ "${CRAFT_TARGET_ARCH}" = "armhf" ] && exit 0
       craftctl default
     override-build: |-
-      [ "$(uname -m)" = "armv7l" ] && exit 0
+      [ "${CRAFT_TARGET_ARCH}" = "armhf" ] && exit 0
       craftctl default
     organize:
       usr/bin/: bin/
@@ -860,16 +909,16 @@ parts:
         - libjpeg-turbo8
         - libpixman-1-0
     override-stage: |-
-      [ "$(uname -m)" = "armv7l" ] && exit 0
+      [ "${CRAFT_TARGET_ARCH}" = "armhf" ] && exit 0
       craftctl default
     override-prime: |-
-      [ "$(uname -m)" = "armv7l" ] && exit 0
+      [ "${CRAFT_TARGET_ARCH}" = "armhf" ] && exit 0
       craftctl default
     override-pull: |-
-      [ "$(uname -m)" = "armv7l" ] && exit 0
+      [ "${CRAFT_TARGET_ARCH}" = "armhf" ] && exit 0
       craftctl default
     override-build: |-
-      [ "$(uname -m)" = "armv7l" ] && exit 0
+      [ "${CRAFT_TARGET_ARCH}" = "armhf" ] && exit 0
 
       # Apply patches from Ubuntu sources.
       cd ../src
@@ -903,7 +952,7 @@ parts:
       - spice-server
       - python-runtime
     source: https://git.launchpad.net/ubuntu/+source/qemu
-    source-commit: 90f147fd1faad479cc95fb4712f104597ee63e27 # import/1%10.2.1+ds-1ubuntu3.1
+    source-commit: 85eabe56085d03cb58c749408801344fc91b9173 # import/1%10.2.1+ds-1ubuntu3.2
     source-depth: 1
     source-type: git
     plugin: autotools
@@ -998,17 +1047,17 @@ parts:
         - seabios # This is needed due to --disable-install-blobs.
         - qemu-system-data # This is needed due to --disable-install-blobs.
     override-stage: |-
-      [ "$(uname -m)" = "armv7l" ] && exit 0
+      [ "${CRAFT_TARGET_ARCH}" = "armhf" ] && exit 0
       craftctl default
     override-prime: |-
-      [ "$(uname -m)" = "armv7l" ] && exit 0
+      [ "${CRAFT_TARGET_ARCH}" = "armhf" ] && exit 0
       craftctl default
     override-pull: |-
-      [ "$(uname -m)" = "armv7l" ] && exit 0
+      [ "${CRAFT_TARGET_ARCH}" = "armhf" ] && exit 0
       craftctl default
 
     override-build: |-
-      [ "$(uname -m)" = "armv7l" ] && exit 0
+      [ "${CRAFT_TARGET_ARCH}" = "armhf" ] && exit 0
       set -ex
       # If configure finds a `.git` dir, it enables -Werror (`--enable-werror` and Git submodules are validated).
       # When building the deb on LP, this `.git` dir is not present because a tarball is used.
@@ -1016,8 +1065,12 @@ parts:
       [ -d .git ] && rm -rf .git
 
       # Mangle the configure a bit
-      QEMUARCH="$(uname -m)"
-      [ "${QEMUARCH}" = "ppc64le" ] && QEMUARCH="ppc64"
+      case "${CRAFT_TARGET_ARCH}" in
+          amd64) QEMUARCH="x86_64" ;;
+          arm64) QEMUARCH="aarch64" ;;
+          ppc64el) QEMUARCH="ppc64" ;;
+          *) QEMUARCH="${CRAFT_TARGET_ARCH}" ;;
+      esac
 
       # Apply patches from Ubuntu sources.
       QUILT_PATCHES=debian/patches quilt push -a
@@ -1051,6 +1104,7 @@ parts:
       usr/local/libexec/: bin/
       usr/local/share/: share/
       usr/share/qemu/efi-virtio.rom: share/qemu/
+      usr/share/qemu/kvmvapic.bin: share/qemu/
       usr/share/qemu/s390-ccw.img: share/qemu/
       usr/share/qemu/slof.bin: share/qemu/
       usr/share/seabios/bios-256k.bin: share/qemu/
@@ -1071,6 +1125,7 @@ parts:
       - to amd64:
         - share/qemu/bios-256k.bin
         - share/qemu/efi-virtio.rom
+        - share/qemu/kvmvapic.bin
         - share/qemu/vgabios-virtio.bin
       - to arm64:
         - share/qemu/vgabios-virtio.bin
@@ -1096,23 +1151,24 @@ parts:
   virtiofsd:
     plugin: nil
     stage-packages:
-      - to amd64:
+      - to armhf: []
+      - else:
         - virtiofsd
     organize:
       usr/libexec/: bin/
     prime:
       - bin/virtiofsd*
     override-stage: |-
-      [ "$(uname -m)" != "x86_64" ] && exit 0
+      [ "${CRAFT_TARGET_ARCH}" != "amd64" ] && exit 0
       craftctl default
     override-prime: |-
-      [ "$(uname -m)" != "x86_64" ] && exit 0
+      [ "${CRAFT_TARGET_ARCH}" != "amd64" ] && exit 0
       craftctl default
     override-pull: |-
-      [ "$(uname -m)" != "x86_64" ] && exit 0
+      [ "${CRAFT_TARGET_ARCH}" != "amd64" ] && exit 0
       craftctl default
     override-build: |-
-      [ "$(uname -m)" != "x86_64" ] && exit 0
+      [ "${CRAFT_TARGET_ARCH}" != "amd64" ] && exit 0
       craftctl default
 
   xfs:
@@ -1166,7 +1222,7 @@ parts:
 
   zfs-2-2:
     source: https://github.com/openzfs/zfs
-    source-commit: 07c1e2e38e2534818acb056223e6cfe1b667155e # zfs-2.2.10
+    source-commit: f2d87f5c724ccdbb27a11fb84c4a185e0a917598 # zfs-2.2.11
     source-depth: 1
     source-type: git
     plugin: autotools
@@ -1179,16 +1235,16 @@ parts:
         - zlib1g-dev
         - libtirpc-dev
     override-stage: |-
-      [ "$(uname -m)" = "armv7l" ] && exit 0
+      [ "${CRAFT_TARGET_ARCH}" = "armhf" ] && exit 0
       craftctl default
     override-prime: |-
-      [ "$(uname -m)" = "armv7l" ] && exit 0
+      [ "${CRAFT_TARGET_ARCH}" = "armhf" ] && exit 0
       craftctl default
     override-pull: |-
-      [ "$(uname -m)" = "armv7l" ] && exit 0
+      [ "${CRAFT_TARGET_ARCH}" = "armhf" ] && exit 0
       craftctl default
     override-build: |-
-      [ "$(uname -m)" = "armv7l" ] && exit 0
+      [ "${CRAFT_TARGET_ARCH}" = "armhf" ] && exit 0
       set -ex
       RAW_VER="${CRAFT_PART_NAME#zfs-}"
       ZFS_VER="${RAW_VER/-/.}"
@@ -1207,7 +1263,7 @@ parts:
 
   zfs-2-3:
     source: https://github.com/openzfs/zfs
-    source-commit: b4842aee84437fccc6f87d436ca4ca8d4da676ae # zfs-2.3.8
+    source-commit: 4c0eb7203e5a2b147d1d5e27b5e2a3461a95c1dc # zfs-2.3.9
     source-depth: 1
     source-type: git
     plugin: autotools
@@ -1220,16 +1276,16 @@ parts:
         - zlib1g-dev
         - libtirpc-dev
     override-stage: |-
-      [ "$(uname -m)" = "armv7l" ] && exit 0
+      [ "${CRAFT_TARGET_ARCH}" = "armhf" ] && exit 0
       craftctl default
     override-prime: |-
-      [ "$(uname -m)" = "armv7l" ] && exit 0
+      [ "${CRAFT_TARGET_ARCH}" = "armhf" ] && exit 0
       craftctl default
     override-pull: |-
-      [ "$(uname -m)" = "armv7l" ] && exit 0
+      [ "${CRAFT_TARGET_ARCH}" = "armhf" ] && exit 0
       craftctl default
     override-build: |-
-      [ "$(uname -m)" = "armv7l" ] && exit 0
+      [ "${CRAFT_TARGET_ARCH}" = "armhf" ] && exit 0
       set -ex
       RAW_VER="${CRAFT_PART_NAME#zfs-}"
       ZFS_VER="${RAW_VER/-/.}"
@@ -1248,7 +1304,7 @@ parts:
 
   zfs-2-4:
     source: https://github.com/openzfs/zfs
-    source-commit: 83020cf8259d057d4cc9102010c05f07ffdfc136 # zfs-2.4.3
+    source-commit: 71a9f9578616a90c3c14bb59629fb4d31bfd68d1 # zfs-2.4.4
     source-depth: 1
     source-type: git
     plugin: autotools
@@ -1261,16 +1317,16 @@ parts:
         - zlib1g-dev
         - libtirpc-dev
     override-stage: |-
-      [ "$(uname -m)" = "armv7l" ] && exit 0
+      [ "${CRAFT_TARGET_ARCH}" = "armhf" ] && exit 0
       craftctl default
     override-prime: |-
-      [ "$(uname -m)" = "armv7l" ] && exit 0
+      [ "${CRAFT_TARGET_ARCH}" = "armhf" ] && exit 0
       craftctl default
     override-pull: |-
-      [ "$(uname -m)" = "armv7l" ] && exit 0
+      [ "${CRAFT_TARGET_ARCH}" = "armhf" ] && exit 0
       craftctl default
     override-build: |-
-      [ "$(uname -m)" = "armv7l" ] && exit 0
+      [ "${CRAFT_TARGET_ARCH}" = "armhf" ] && exit 0
       set -ex
       RAW_VER="${CRAFT_PART_NAME#zfs-}"
       ZFS_VER="${RAW_VER/-/.}"
@@ -1441,16 +1497,28 @@ parts:
       - to arm64:
         - python3-uefivars
     override-stage: |-
-      [ "$(uname -m)" != "x86_64" ] && [ "$(uname -m)" != "aarch64" ] && exit 0
+      case "${CRAFT_TARGET_ARCH}" in
+          amd64|arm64) ;;
+          *) exit 0 ;;
+      esac
       craftctl default
     override-prime: |-
-      [ "$(uname -m)" != "x86_64" ] && [ "$(uname -m)" != "aarch64" ] && exit 0
+      case "${CRAFT_TARGET_ARCH}" in
+          amd64|arm64) ;;
+          *) exit 0 ;;
+      esac
       craftctl default
     override-pull: |-
-      [ "$(uname -m)" != "x86_64" ] && [ "$(uname -m)" != "aarch64" ] && exit 0
+      case "${CRAFT_TARGET_ARCH}" in
+          amd64|arm64) ;;
+          *) exit 0 ;;
+      esac
       craftctl default
     override-build: |-
-      [ "$(uname -m)" != "x86_64" ] && [ "$(uname -m)" != "aarch64" ] && exit 0
+      case "${CRAFT_TARGET_ARCH}" in
+          amd64|arm64) ;;
+          *) exit 0 ;;
+      esac
       craftctl default
     organize:
       usr/bin/uefivars: bin/uefivars.py
@@ -1560,13 +1628,14 @@ parts:
 
       # Some python dependencies are not available for armhf or just require a build from source.
       # Not worth the effort for now.
-      if [ "$(uname -m)" != "armv7l" ]; then
+      if [ "${CRAFT_TARGET_ARCH}" != "armhf" ]; then
         # Build the static website
         # XXX: needed for snapcraft 8.x only
         PATH="/usr/bin:${PATH}" make doc # ensure python3 is found in PATH
 
         # Remove unneeded bits
         rm doc/_build/objects.inv    # only objects.inv.txt is used
+        rm -f doc/_build/llms*.txt   # LLM-targeted docs are not needed in the snap
         # not needed once built
         rm doc/_build/.buildinfo
         rm -rf doc/_build/_sphinx_design_static/
@@ -1629,23 +1698,20 @@ parts:
       - nodejs
       - npm
     override-prime: |-
-      [ "$(uname -m)" = "armv7l" ] && exit 0
+      [ "${CRAFT_TARGET_ARCH}" = "armhf" ] && exit 0
       craftctl default
     override-pull: |-
-      [ "$(uname -m)" = "armv7l" ] && exit 0
+      [ "${CRAFT_TARGET_ARCH}" = "armhf" ] && exit 0
 
       craftctl default
     override-build: |
-      [ "$(uname -m)" = "armv7l" ] && exit 0
+      [ "${CRAFT_TARGET_ARCH}" = "armhf" ] && exit 0
 
       craftctl default
 
       npm install yarn --global
-      yarn install
+      yarn install --network-timeout 600000
       yarn build
-
-      # Drop unused localisation files from Monaco Editor (the UI does not allow localization)
-      rm -f build/ui/monaco-editor/min/vs/nls.messages.*.js
 
       mkdir -p "${CRAFT_PART_INSTALL}/share"
       cp -R build/ui "${CRAFT_PART_INSTALL}/share/lxd-ui/"
@@ -1781,10 +1847,9 @@ parts:
 
   wrappers:
     plugin: dump
-    source: snapcraft/
+    source: snap/local/
     organize:
       commands/snap-query: bin/
-      hooks/: snap/hooks/
       wrappers/lxd-stophook: bin/lxd
       wrappers/gpu-2604-custom-wrapper: bin/
       wrappers/editor: bin/

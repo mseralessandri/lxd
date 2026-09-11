@@ -715,6 +715,63 @@ func (o *Operation) ScanArgs() []any {
 	return []any{&o.Row.ID, &o.Row.UUID, &o.Row.NodeID, &o.Row.Type, &o.Row.ProjectID, &o.Row.RequestorProtocol, &o.Row.RequestorIdentityID, &o.Row.EntityID, &o.Row.Metadata, &o.Row.Class, &o.Row.CreatedAt, &o.Row.UpdatedAt, &o.Row.Inputs, &o.Row.StatusCode, &o.Row.Error, &o.Row.ConflictReference, &o.Row.Parent, &o.Row.Stage, &o.Row.ErrorCode, &o.ProjectName, &o.NodeAddress, &o.NodeName, &o.IdentityIdentifier}
 }
 
+// TableName returns the table name for [OperationsResourcesRow] entities.
+func (o OperationsResourcesRow) TableName() string {
+	return "operations_resources"
+}
+
+// SelectColumns returns a slice of column names for [OperationsResourcesRow] entities.
+func (o OperationsResourcesRow) SelectColumns() []string {
+	return []string{
+		"operations_resources.operation_id",
+		"operations_resources.entity_id",
+		"operations_resources.entity_type",
+	}
+}
+
+// Joins returns a slice of join expressions for [OperationsResourcesRow].
+func (o OperationsResourcesRow) Joins() []string {
+	return []string{}
+}
+
+// ScanArgs implements [query.ScanArger] for [OperationsResourcesRow].
+// This returns references to struct fields in definition order.
+func (o *OperationsResourcesRow) ScanArgs() []any {
+	return []any{&o.OperationID, &o.EntityID, &o.EntityType}
+}
+
+// CreateValues returns a list of values from [OperationsResourcesRow] entities matching the bind arguments in [CreateStmt].
+func (o OperationsResourcesRow) CreateValues() []any {
+	return []any{o.OperationID, o.EntityID, o.EntityType}
+}
+
+// UpdateValues returns a list of values from [OperationsResourcesRow] entities matching the columns in [UpdateStmt].
+func (o OperationsResourcesRow) UpdateValues() []any {
+	return []any{o.OperationID, o.EntityID, o.EntityType}
+}
+
+// PKColumns returns the column names for the primary key of a [OperationsResourcesRow] entity used during an update.
+// The returned slice must have the same number of elements as PKValues.
+func (o OperationsResourcesRow) PKColumns() []string {
+	return []string{"operation_id", "entity_id", "entity_type"}
+}
+
+// PKValues returns the values for the primary key of a [OperationsResourcesRow] entity used during an update.
+// The returned slice must have the same number of elements as PKColumns.
+func (o OperationsResourcesRow) PKValues() []any {
+	return []any{o.OperationID, o.EntityID, o.EntityType}
+}
+
+// CreateStmt returns a query that creates a [OperationsResourcesRow] entity.
+func (o OperationsResourcesRow) CreateStmt() string {
+	return "INSERT INTO operations_resources (operation_id, entity_id, entity_type) VALUES (?, ?, ?)"
+}
+
+// UpdateStmt returns a query that updates a [OperationsResourcesRow] by primary key.
+func (o OperationsResourcesRow) UpdateStmt() string {
+	return "UPDATE operations_resources SET operation_id = ?, entity_id = ?, entity_type = ? "
+}
+
 // TableName returns the table name for [OperationsRow] entities.
 func (o OperationsRow) TableName() string {
 	return "operations"
@@ -897,8 +954,6 @@ func (r Replicator) SelectColumns() []string {
 		"replicators.name",
 		"replicators.project_id",
 		"replicators.description",
-		"replicators.last_run_date",
-		"replicators.last_run_status",
 		"projects.name",
 	}
 }
@@ -913,7 +968,7 @@ func (r Replicator) Joins() []string {
 // ScanArgs implements [query.ScanArger] for [Replicator].
 // This returns references to struct fields in definition order.
 func (r *Replicator) ScanArgs() []any {
-	return []any{&r.Row.ID, &r.Row.Name, &r.Row.ProjectID, &r.Row.Description, &r.Row.LastRunDate, &r.Row.LastRunStatus, &r.ProjectName}
+	return []any{&r.Row.ID, &r.Row.Name, &r.Row.ProjectID, &r.Row.Description, &r.ProjectName}
 }
 
 // TableName returns the table name for [ReplicatorRow] entities.
@@ -928,8 +983,6 @@ func (r ReplicatorRow) SelectColumns() []string {
 		"replicators.name",
 		"replicators.project_id",
 		"replicators.description",
-		"replicators.last_run_date",
-		"replicators.last_run_status",
 	}
 }
 
@@ -941,17 +994,17 @@ func (r ReplicatorRow) Joins() []string {
 // ScanArgs implements [query.ScanArger] for [ReplicatorRow].
 // This returns references to struct fields in definition order.
 func (r *ReplicatorRow) ScanArgs() []any {
-	return []any{&r.ID, &r.Name, &r.ProjectID, &r.Description, &r.LastRunDate, &r.LastRunStatus}
+	return []any{&r.ID, &r.Name, &r.ProjectID, &r.Description}
 }
 
 // CreateValues returns a list of values from [ReplicatorRow] entities matching the bind arguments in [CreateStmt].
 func (r ReplicatorRow) CreateValues() []any {
-	return []any{r.Name, r.ProjectID, r.Description, r.LastRunDate, r.LastRunStatus}
+	return []any{r.Name, r.ProjectID, r.Description}
 }
 
 // UpdateValues returns a list of values from [ReplicatorRow] entities matching the columns in [UpdateStmt].
 func (r ReplicatorRow) UpdateValues() []any {
-	return []any{r.Name, r.ProjectID, r.Description, r.LastRunDate, r.LastRunStatus}
+	return []any{r.Name, r.ProjectID, r.Description}
 }
 
 // PKColumns returns the column names for the primary key of a [ReplicatorRow] entity used during an update.
@@ -968,10 +1021,72 @@ func (r ReplicatorRow) PKValues() []any {
 
 // CreateStmt returns a query that creates a [ReplicatorRow] entity.
 func (r ReplicatorRow) CreateStmt() string {
-	return "INSERT INTO replicators (name, project_id, description, last_run_date, last_run_status) VALUES (?, ?, ?, ?, ?)"
+	return "INSERT INTO replicators (name, project_id, description) VALUES (?, ?, ?)"
 }
 
 // UpdateStmt returns a query that updates a [ReplicatorRow] by primary key.
 func (r ReplicatorRow) UpdateStmt() string {
-	return "UPDATE replicators SET name = ?, project_id = ?, description = ?, last_run_date = ?, last_run_status = ? "
+	return "UPDATE replicators SET name = ?, project_id = ?, description = ? "
+}
+
+// TableName returns the table name for [ReplicatorsStatusRow] entities.
+func (r ReplicatorsStatusRow) TableName() string {
+	return "replicators_status"
+}
+
+// SelectColumns returns a slice of column names for [ReplicatorsStatusRow] entities.
+func (r ReplicatorsStatusRow) SelectColumns() []string {
+	return []string{
+		"replicators_status.id",
+		"replicators_status.mode",
+		"replicators_status.status",
+		"replicators_status.started_date",
+		"replicators_status.finished_date",
+		"replicators_status.snapshot_started_date",
+		"replicators_status.snapshot_finished_date",
+		"replicators_status.replicator_id",
+	}
+}
+
+// Joins returns a slice of join expressions for [ReplicatorsStatusRow].
+func (r ReplicatorsStatusRow) Joins() []string {
+	return []string{}
+}
+
+// ScanArgs implements [query.ScanArger] for [ReplicatorsStatusRow].
+// This returns references to struct fields in definition order.
+func (r *ReplicatorsStatusRow) ScanArgs() []any {
+	return []any{&r.ID, &r.Mode, &r.Status, &r.StartedDate, &r.FinishedDate, &r.SnapshotStartedDate, &r.SnapshotFinishedDate, &r.ReplicatorID}
+}
+
+// CreateValues returns a list of values from [ReplicatorsStatusRow] entities matching the bind arguments in [CreateStmt].
+func (r ReplicatorsStatusRow) CreateValues() []any {
+	return []any{r.Mode, r.Status, r.StartedDate, r.FinishedDate, r.SnapshotStartedDate, r.SnapshotFinishedDate, r.ReplicatorID}
+}
+
+// UpdateValues returns a list of values from [ReplicatorsStatusRow] entities matching the columns in [UpdateStmt].
+func (r ReplicatorsStatusRow) UpdateValues() []any {
+	return []any{r.Status, r.FinishedDate, r.SnapshotStartedDate, r.SnapshotFinishedDate}
+}
+
+// PKColumns returns the column names for the primary key of a [ReplicatorsStatusRow] entity used during an update.
+// The returned slice must have the same number of elements as PKValues.
+func (r ReplicatorsStatusRow) PKColumns() []string {
+	return []string{"id"}
+}
+
+// PKValues returns the values for the primary key of a [ReplicatorsStatusRow] entity used during an update.
+// The returned slice must have the same number of elements as PKColumns.
+func (r ReplicatorsStatusRow) PKValues() []any {
+	return []any{r.ID}
+}
+
+// CreateStmt returns a query that creates a [ReplicatorsStatusRow] entity.
+func (r ReplicatorsStatusRow) CreateStmt() string {
+	return "INSERT INTO replicators_status (mode, status, started_date, finished_date, snapshot_started_date, snapshot_finished_date, replicator_id) VALUES (?, ?, ?, ?, ?, ?, ?)"
+}
+
+// UpdateStmt returns a query that updates a [ReplicatorsStatusRow] by primary key.
+func (r ReplicatorsStatusRow) UpdateStmt() string {
+	return "UPDATE replicators_status SET status = ?, finished_date = ?, snapshot_started_date = ?, snapshot_finished_date = ? "
 }

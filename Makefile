@@ -2,15 +2,17 @@ DOMAIN=lxd
 VERSION=$(or ${CUSTOM_VERSION},$(shell grep "var Version" shared/version/flex.go | cut -d'"' -f2))
 ARCHIVE=lxd-$(VERSION).tar
 HASH := \#
-TAG_SQLITE3=$(shell printf "$(HASH)include <dqlite.h>\nvoid main(){dqlite_node_id n = 1;}" | $(CC) ${CGO_CFLAGS} -o /dev/null -xc - >/dev/null 2>&1 && echo "libsqlite3")
 GOPATH ?= $(shell go env GOPATH)
+# Expand immediately so the "go env" call runs once per make invocation.
+GOPATH := $(GOPATH)
 CGO_LDFLAGS_ALLOW ?= (-Wl,-wrap,pthread_create)|(-Wl,-z,now)
 SPHINXENV=doc/.sphinx/venv/bin/activate
 SPHINXPIPPATH=doc/.sphinx/venv/bin/pip
-GOMIN=1.26.4
+GOMIN=1.26.7
 GOTOOLCHAIN=local
 export GOTOOLCHAIN
 GOCOVERDIR ?= $(shell go env GOCOVERDIR)
+GOCOVERDIR := $(GOCOVERDIR)
 ifeq "$(GOCOVERDIR)" ""
 	COVER=
 	COVER_TEST=
@@ -19,6 +21,7 @@ else
 	COVER_TEST=-test.gocoverdir="$(GOCOVERDIR)"
 endif
 ARCH ?= $(shell uname -m)
+ARCH := $(ARCH)
 DQLITE_BRANCH=v1.18.x
 LIBLXC_BRANCH=main
 
@@ -29,13 +32,14 @@ else
 endif
 DQLITE_PATH=$(DEPS_PATH)/dqlite
 LIBLXC_PATH=$(DEPS_PATH)/liblxc
-LIBLXC_ROOTFS_MOUNT_PATH=$(GOPATH)/bin/liblxc/rootfs
+LIBLXC_ROOTFS_MOUNT_PATH=$(LIBLXC_PATH)/rootfs
 
 export CGO_CFLAGS ?= -I$(DQLITE_PATH)/include/ -I$(LIBLXC_PATH)/include/
 export CGO_LDFLAGS ?= -L$(DQLITE_PATH)/.libs/ -L$(LIBLXC_PATH)/lib/$(ARCH)-linux-gnu/
 export LD_LIBRARY_PATH ?= $(DQLITE_PATH)/.libs/:$(LIBLXC_PATH)/lib/$(ARCH)-linux-gnu/
 export PKG_CONFIG_PATH ?= $(LIBLXC_PATH)/lib/$(ARCH)-linux-gnu/pkgconfig
 export CGO_LDFLAGS_ALLOW ?= (-Wl,-wrap,pthread_create)|(-Wl,-z,now)
+TAG_SQLITE3 := $(shell printf "$(HASH)include <dqlite.h>\nvoid main(){dqlite_node_id n = 1;}" | $(CC) ${CGO_CFLAGS} -o /dev/null -xc - >/dev/null 2>&1 && echo "libsqlite3")
 
 .PHONY: default
 default: all
@@ -136,10 +140,12 @@ dqlite:
 		git -C "$(DQLITE_PATH)" checkout -B "${DQLITE_BRANCH}" FETCH_HEAD; \
 	fi
 
-	cd "$(DQLITE_PATH)" && \
-		autoreconf -i && \
-		./configure --enable-build-raft && \
-		make -j
+	@if [ ! -f "$(DQLITE_PATH)/Makefile" ]; then \
+		cd "$(DQLITE_PATH)" && \
+			autoreconf -i && \
+			./configure --enable-build-raft; \
+	fi
+	cd "$(DQLITE_PATH)" && make -j
 
 ifneq ($(shell command -v ldd),)
 	# verify that libdqlite.so is linked against some critically important libs
@@ -160,33 +166,32 @@ liblxc:
 		git -C "$(LIBLXC_PATH)" checkout -B "$(LIBLXC_BRANCH)" FETCH_HEAD; \
 	fi
 
-	# XXX: the rootfs-mount-path must not depend on LIBLXC_PATH to allow
-	# building in "vendor" mode but move the resulting binaries elsewhere for
-	# caching purposes
-	cd "$(LIBLXC_PATH)" && \
-		meson setup \
-			--buildtype=release \
-			-Dapparmor=true \
-			-Dcapabilities=true \
-			-Dcommands=false \
-			-Ddbus=false \
-			-Dexamples=false \
-			-Dinstall-init-files=false \
-			-Dinstall-state-dirs=false \
-			-Dlibdir="lib/$(ARCH)-linux-gnu" \
-			-Dman=false \
-			-Dmemfd-rexec=false \
-			-Dopenssl=false \
-			-Dprefix="$(LIBLXC_PATH)" \
-			-Drootfs-mount-path="$(LIBLXC_ROOTFS_MOUNT_PATH)" \
-			-Dseccomp=true \
-			-Dselinux=false \
-			-Dspecfile=false \
-			-Dtests=false \
-			-Dtools=false \
-			build && \
-		meson compile -C build && \
-		ninja -C build install
+	@mkdir -p "$(LIBLXC_ROOTFS_MOUNT_PATH)"
+	@if [ ! -d "$(LIBLXC_PATH)/build" ]; then \
+		cd "$(LIBLXC_PATH)" && \
+			meson setup \
+				--buildtype=release \
+				-Dapparmor=true \
+				-Dcapabilities=true \
+				-Dcommands=false \
+				-Ddbus=false \
+				-Dexamples=false \
+				-Dinstall-init-files=false \
+				-Dinstall-state-dirs=false \
+				-Dlibdir="lib/$(ARCH)-linux-gnu" \
+				-Dman=false \
+				-Dmemfd-rexec=false \
+				-Dopenssl=false \
+				-Dprefix="$(LIBLXC_PATH)" \
+				-Drootfs-mount-path="$(LIBLXC_ROOTFS_MOUNT_PATH)" \
+				-Dseccomp=true \
+				-Dselinux=false \
+				-Dspecfile=false \
+				-Dtests=false \
+				-Dtools=false \
+				build; \
+	fi
+	cd "$(LIBLXC_PATH)" && ninja -C build install
 
 ifneq ($(shell command -v ldd),)
 	# verify that liblxc.so is linked against some critically important libs

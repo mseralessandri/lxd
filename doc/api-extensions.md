@@ -607,13 +607,6 @@ This adds a new `lifecycle` message type to the events API.
 
 This adds the ability to copy and move custom storage volumes between remote.
 
-(extension-nvidia-runtime)=
-## `nvidia_runtime`
-
-Adds a {config:option}`instance-nvidia:nvidia.runtime` configuration option for containers, setting this to
-`true` will have the NVIDIA runtime and CUDA libraries passed to the
-container.
-
 (extension-container-mount-propagation)=
 ## `container_mount_propagation`
 
@@ -772,16 +765,6 @@ This effectively allows for [`lxc list`](lxc_list.md) to get all it needs in one
 
 This introduces a new {config:option}`server-miscellaneous:backups.compression_algorithm` configuration key which
 allows configuration of backup compression.
-
-(extension-nvidia-runtime-config)=
-## `nvidia_runtime_config`
-
-This introduces a few extra configuration keys when using {config:option}`instance-nvidia:nvidia.runtime` and the `libnvidia-container` library.
-Those keys translate pretty much directly to the matching NVIDIA container environment variables:
-
-* {config:option}`instance-nvidia:nvidia.driver.capabilities` => `NVIDIA_DRIVER_CAPABILITIES`
-* {config:option}`instance-nvidia:nvidia.require.cuda` => `NVIDIA_REQUIRE_CUDA`
-* {config:option}`instance-nvidia:nvidia.require.driver` => `NVIDIA_REQUIRE_DRIVER`
 
 (extension-storage-api-volume-snapshots)=
 ## `storage_api_volume_snapshots`
@@ -3619,8 +3602,6 @@ The following changes are included:
 - `mig.gi` and `mig.ci`: The GPU instance ID and compute instance ID pair is now resolved to a MIG UUID via NVML, which is then used as a CDI identifier.
 - `id`: Now accepts either a CDI identifier for `gputype=mig` devices or a DRM card ID selector for the parent GPU. Supported CDI formats are `nvidia.com/mig=<uuid>` and `nvidia.com/mig=<dev_idx>:<mig_idx>`. When a CDI identifier is provided, it is used directly and is mutually exclusive with `mig.uuid`, `mig.gi`, and `mig.ci`.
 
-Because the legacy `nvidia.runtime` instance-level option is incompatible with CDI-based MIG passthrough, attaching a `gputype=mig` device to a container with {config:option}`instance-nvidia:nvidia.runtime` set to `true` is rejected. To preserve backward compatibility, an upgrade patch unsets `nvidia.runtime` on existing containers and snapshots that have a `gputype=mig` device attached.
-
 (extension-cluster-links-unidirectional)=
 ## `cluster_links_unidirectional`
 
@@ -3639,3 +3620,54 @@ New configuration options on the load balancer pool are added to further customi
 * {config:option}`network-load-balancer-pool-properties:healthcheck.failure_count`
 
 In addition a new endpoint [`GET /1.0/networks/{networkName}/load-balancer-pools/{poolName}/state`](swagger:/network-load-balancer-pools/network_load_balancer_pool_state_get) is added which returns the health check status for all instances in the pool.
+
+(extension-operation-child-count)=
+## `operation_child_count`
+
+Adds a `child_count` field to the `Operation` struct, indicating the number of child operations. This allows clients to determine whether an operation has children without requiring `recursion=2`.
+
+(extension-storage-driver-powerstore-nvme)=
+## `storage_driver_powerstore_nvme`
+
+Adds NVMe/TCP support to the Dell PowerStore storage driver.
+NVMe/TCP is now the default PowerStore mode when `powerstore.mode` is not set.
+
+(extension-access-management-expiry)=
+## `access_management_expiry`
+
+Adds an `expires_at` field to the `Identity` struct, so that the expiry of an identity's credential is reported when identities are listed or individually retrieved, and not only for the current identity.
+
+For identities whose authentication method is `tls`, this is the expiry of the identity's certificate.
+For identities whose authentication method is `bearer`, this is the expiry of the issued token.
+For bearer tokens the expiry is recorded when a token is issued and cleared when a token is revoked.
+The field is omitted for identities whose credential has no expiry, that have no credential yet (pending identities), or whose token has been revoked.
+
+Note that bearer identities created prior to this extension will have an omitted `expires_at` field until a new token is issued.
+
+(extension-cluster-links-public)=
+## `cluster_links_public`
+
+This extends the {ref}`cluster links <exp-cluster-links>` API with support for public cluster links. The initiating cluster (Cluster A) connects to the remote cluster (Cluster B) without presenting a client certificate, relying solely on TLS certificate pinning for server authentication. Cluster B has no record of the link, and neither cluster creates an identity for the other. This is useful when Cluster B exposes resources publicly or when anonymous read access to Cluster B is sufficient.
+
+Creating a public cluster link is a two-phase process:
+
+1. Send a `POST` request to Cluster A with a name and `remote_address` (no `fingerprint`) to create a pending link. Cluster A fetches Cluster B's TLS certificate, confirms Cluster B is serving the LXD API, creates the pending link, and returns the certificate's fingerprint for user verification. The certificate is held in `volatile.pending_certificate` and the verified address in `volatile.pending_address`. Neither is pinned yet, so the link remains inert (unreachable) until confirmed. Repeating this request for a link that is still pending refreshes it instead of returning a conflict, so a caller can retry an interrupted creation.
+2. To confirm the certificate, send a second `POST` request to Cluster A with the same name and the `fingerprint` returned by the first request. Cluster A rejects this second request if the fingerprint does not match or if the request sets `remote_address`. If the fingerprint matches, Cluster A pins the certificate already held in `volatile.pending_certificate`, and pins the canonical address (with an explicit port) already recorded in `volatile.pending_address` into `volatile.addresses`. This ensures that Cluster A always pins the original certificate fetched from Cluster B and the verified address, rather than a certificate or address supplied in the confirm request.
+
+A new `ClusterLinkCertificate` response type is introduced, containing the certificate fingerprint returned by the first request, and a matching `fingerprint` field is added to `ClusterLinksPost` for echoing it back. Both are used only by public cluster links.
+
+Replication requires the remote cluster to authenticate the connection, so {ref}`replicators <exp-replicators>` and a project's `replica.cluster` accept only cluster link types that present a client certificate (currently `bidirectional` and `unidirectional`). Both reject a public cluster link at configuration time.
+
+(extension-durable-operations)=
+## `durable_operations`
+
+Introduces new operation class for durable operations.
+Durable operations are restarted on the DQLite raft leader if the member that is running the operation fails to respond to heartbeats.
+If the leader was running the operation and goes offline, the operation is restarted on the newly elected leader.
+
+(extension-access-management-bearer-pending)=
+## `access_management_bearer_pending`
+
+Adds three identity types, `Client token bearer (pending)`, `DevLXD token bearer (pending)` and `Initial UI token bearer (pending)`, that represent bearer identities for which no token is currently issued.
+
+A bearer identity is created in the pending state because no token has been issued for it yet. Issuing a token promotes the identity to its active type of `Client token bearer`, `DevLXD token bearer` or `Initial UI token bearer`, and revoking the token demotes it back to the pending type. A token that has expired but has not been revoked leaves the identity active.

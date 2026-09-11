@@ -19,16 +19,18 @@ import (
 )
 
 var networkZoneRecordsCmd = APIEndpoint{
-	Path:        "network-zones/{zone}/records",
-	MetricsType: entity.TypeNetwork,
+	Path:            "network-zones/{zone}/records",
+	MetricsType:     entity.TypeNetwork,
+	ProjectSpecific: true,
 
 	Get:  APIEndpointAction{Handler: networkZoneRecordsGet, AccessHandler: networkZoneAccessHandler(auth.EntitlementCanView)},
 	Post: APIEndpointAction{Handler: networkZoneRecordsPost, AccessHandler: networkZoneAccessHandler(auth.EntitlementCanEdit)},
 }
 
 var networkZoneRecordCmd = APIEndpoint{
-	Path:        "network-zones/{zone}/records/{name}",
-	MetricsType: entity.TypeNetwork,
+	Path:            "network-zones/{zone}/records/{name}",
+	MetricsType:     entity.TypeNetwork,
+	ProjectSpecific: true,
 
 	Delete: APIEndpointAction{Handler: networkZoneRecordDelete, AccessHandler: networkZoneAccessHandler(auth.EntitlementCanEdit)},
 	Get:    APIEndpointAction{Handler: networkZoneRecordGet, AccessHandler: networkZoneAccessHandler(auth.EntitlementCanView)},
@@ -248,7 +250,7 @@ func networkZoneRecordsPost(d *Daemon, r *http.Request) response.Response {
 	args := operations.OperationArgs{
 		ProjectName: details.requestProject.Name,
 		Type:        operationtype.NetworkZoneRecordCreate,
-		Class:       operations.OperationClassTask,
+		Class:       operationtype.OperationClassTask,
 		RunHook:     run,
 		EntityURL:   entity.NetworkZoneURL(effectiveProjectName, details.zoneName),
 		Metadata: map[string]any{
@@ -261,7 +263,7 @@ func networkZoneRecordsPost(d *Daemon, r *http.Request) response.Response {
 		return response.InternalError(err)
 	}
 
-	return operations.OperationResponse(op)
+	return response.OperationResponse(op)
 }
 
 // swagger:operation DELETE /1.0/network-zones/{zone}/records/{name} network-zones network_zone_record_delete
@@ -331,7 +333,7 @@ func networkZoneRecordDelete(d *Daemon, r *http.Request) response.Response {
 	args := operations.OperationArgs{
 		ProjectName: details.requestProject.Name,
 		Type:        operationtype.NetworkZoneRecordDelete,
-		Class:       operations.OperationClassTask,
+		Class:       operationtype.OperationClassTask,
 		RunHook:     run,
 		EntityURL:   entity.NetworkZoneURL(effectiveProjectName, details.zoneName),
 	}
@@ -341,7 +343,7 @@ func networkZoneRecordDelete(d *Daemon, r *http.Request) response.Response {
 		return response.InternalError(err)
 	}
 
-	return operations.OperationResponse(op)
+	return response.OperationResponse(op)
 }
 
 // swagger:operation GET /1.0/network-zones/{zone}/records/{name} network-zones network_zone_record_get
@@ -559,7 +561,7 @@ func networkZoneRecordPut(d *Daemon, r *http.Request) response.Response {
 	args := operations.OperationArgs{
 		ProjectName: details.requestProject.Name,
 		Type:        operationtype.NetworkZoneRecordUpdate,
-		Class:       operations.OperationClassTask,
+		Class:       operationtype.OperationClassTask,
 		RunHook:     run,
 		EntityURL:   entity.NetworkZoneURL(effectiveProjectName, details.zoneName),
 	}
@@ -569,5 +571,5 @@ func networkZoneRecordPut(d *Daemon, r *http.Request) response.Response {
 		return response.InternalError(err)
 	}
 
-	return operations.OperationResponse(op)
+	return response.OperationResponse(op)
 }

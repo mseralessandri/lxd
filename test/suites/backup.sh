@@ -271,8 +271,6 @@ test_container_recover() {
   local poolDriver
   poolDriver="$(storage_backend "${LXD_IMPORT_DIR}")"
   (
-    set -e
-
     # shellcheck disable=SC2030
     LXD_DIR=${LXD_IMPORT_DIR}
 
@@ -498,6 +496,25 @@ _backup_import_with_project() {
     lxc start c1
     lxc delete --force c1
   fi
+
+  # A backup's index.yaml carries the instance name. Anyone who can craft a tarball can set it.
+  # The import turns the name into the on-disk volume path so a value containing ../ must be
+  # rejected before any directory is created or any content is unpacked.
+  mkdir "${LXD_DIR}/traversal"
+  tar -xzf "${LXD_DIR}/c1.tar.gz" -C "${LXD_DIR}/traversal"
+
+  # Repack the backup with a path-traversal name in the index.yaml.
+  sed -i 's|^name: .*|name: ../../../../lxd-traversal-poc|' "${LXD_DIR}/traversal/backup/index.yaml"
+  tar -czf "${LXD_DIR}/c1-traversal.tar.gz" -C "${LXD_DIR}/traversal" backup
+
+  # The import must be refused by name validation.
+  OUTPUT="$(! lxc import "${LXD_DIR}/c1-traversal.tar.gz" 2>&1 || false)"
+  if ! echo "${OUTPUT}" | grep -F "Invalid instance name" ; then
+    echo "path-traversal instance name was not rejected on import"
+    false
+  fi
+
+  rm -rf "${LXD_DIR}/traversal" "${LXD_DIR}/c1-traversal.tar.gz"
 
   # with snapshots
 
@@ -1107,8 +1124,6 @@ test_backup_export_import_recover() {
   fi
 
   (
-    set -e
-
     local poolName
     poolName="lxdtest-$(basename "${LXD_DIR}")"
 
@@ -1313,8 +1328,11 @@ test_backup_inconsistent_config() {
   poolName="lxdtest-$(basename "${LXD_DIR}")"
 
   # Create a restricted project and switch to it.
+  # Allow snapshots so that backup archives containing snapshots can be imported;
+  # this test is about config reconciliation, not snapshot restriction enforcement.
   lxc project create restricted \
-    -c restricted=true
+    -c restricted=true \
+    -c restricted.snapshots=allow
   lxc profile device add default root disk path=/ pool="${poolName}" --project restricted
 
   # Switch to restricted project to test imports.

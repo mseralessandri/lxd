@@ -1026,61 +1026,6 @@ func (d *lxc) initLXC(config bool) (*liblxc.Container, error) {
 		}
 	}
 
-	// Setup NVIDIA runtime
-	if shared.IsTrue(d.expandedConfig["nvidia.runtime"]) {
-		hookDir := os.Getenv("LXD_LXC_HOOK")
-		if hookDir == "" {
-			hookDir = "/usr/share/lxc/hooks"
-		}
-
-		hookPath := filepath.Join(hookDir, "nvidia")
-		if !shared.PathExists(hookPath) {
-			return nil, errors.New("The NVIDIA LXC hook could not be found")
-		}
-
-		_, err := exec.LookPath("nvidia-container-cli")
-		if err != nil {
-			return nil, errors.New("The NVIDIA container tools could not be found")
-		}
-
-		err = lxcSetConfigItem(cc, "lxc.environment", "NVIDIA_VISIBLE_DEVICES=none")
-		if err != nil {
-			return nil, err
-		}
-
-		nvidiaDriver := d.expandedConfig["nvidia.driver.capabilities"]
-		if nvidiaDriver == "" {
-			err = lxcSetConfigItem(cc, "lxc.environment", "NVIDIA_DRIVER_CAPABILITIES=compute,utility")
-		} else {
-			err = lxcSetConfigItem(cc, "lxc.environment", "NVIDIA_DRIVER_CAPABILITIES="+nvidiaDriver)
-		}
-
-		if err != nil {
-			return nil, err
-		}
-
-		nvidiaRequireCuda := d.expandedConfig["nvidia.require.cuda"]
-		if nvidiaRequireCuda != "" {
-			err = lxcSetConfigItem(cc, "lxc.environment", "NVIDIA_REQUIRE_CUDA="+nvidiaRequireCuda)
-			if err != nil {
-				return nil, err
-			}
-		}
-
-		nvidiaRequireDriver := d.expandedConfig["nvidia.require.driver"]
-		if nvidiaRequireDriver != "" {
-			err = lxcSetConfigItem(cc, "lxc.environment", "NVIDIA_REQUIRE_DRIVER="+nvidiaRequireDriver)
-			if err != nil {
-				return nil, err
-			}
-		}
-
-		err = lxcSetConfigItem(cc, "lxc.hook.mount", hookPath)
-		if err != nil {
-			return nil, err
-		}
-	}
-
 	if shared.IsTrue(d.expandedConfig["security.delegate_bpf"]) {
 		err = lxcSetConfigItem(cc, "lxc.hook.start-host", d.state.OS.ExecPath+" callhook "+shared.VarPath("")+" "+projectShellQuoted+" "+instanceShellQuoted+" starthost")
 		if err != nil {
@@ -1670,7 +1615,7 @@ func (d *lxc) deviceHandleMounts(mounts []deviceConfig.MountEntryItem) error {
 
 			_, err = files.Lstat(relativeTargetPath)
 			if err == nil {
-				err := d.removeMount(mount.TargetPath)
+				err := d.RemoveMount(mount.TargetPath)
 				if err != nil {
 					return fmt.Errorf("Error unmounting the device path inside container: %s", err)
 				}
@@ -2426,7 +2371,7 @@ func (d *lxc) onStart(_ map[string]string) error {
 		err = d.templateApplyNow(instance.TemplateTrigger(d.localConfig[key]))
 		if err != nil {
 			_ = apparmor.InstanceUnload(d.state.OS, d)
-			return err
+			return fmt.Errorf("Failed applying template: %w", err)
 		}
 
 		err := d.state.DB.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
@@ -2442,7 +2387,7 @@ func (d *lxc) onStart(_ map[string]string) error {
 	err = d.templateApplyNow("start")
 	if err != nil {
 		_ = apparmor.InstanceUnload(d.state.OS, d)
-		return err
+		return fmt.Errorf("Failed applying template: %w", err)
 	}
 
 	// Record last start state.
@@ -2460,7 +2405,7 @@ func (d *lxc) onStart(_ map[string]string) error {
 // mountBpfFs mounts bpffs inside the container.
 func (d *lxc) mountBpfFs(pid int, bpffsParams map[string]string) error {
 	if !d.state.OS.BPFToken {
-		return errors.New("BPF Token mechanism is not supported by kernel running")
+		return errors.New("BPF Token mechanism is not supported by the running kernel")
 	}
 
 	pidFdNr, pidFd := seccomp.MakePidFd(pid, d.state)
@@ -2819,6 +2764,9 @@ func (d *lxc) Restart(ctx context.Context, timeout time.Duration, progressReport
 
 // Rebuild rebuilds the instance using the supplied image fingerprint as source.
 func (d *lxc) Rebuild(ctx context.Context, img *api.Image, op *operations.Operation) error {
+	// Rebuild assumes instance is stopped.  But a stopped instance could still have a running
+	// forkfile.  So stop the forkfile.
+	d.StopForkFile(false)
 	return d.rebuildCommon(ctx, d, img, op)
 }
 
@@ -4080,7 +4028,7 @@ func (d *lxc) Update(ctx context.Context, args db.InstanceArgs, actionType insta
 					reverter.Add(func() { _ = files.Close() })
 					_, err = files.Lstat("/dev/lxd")
 					if err == nil {
-						err = d.removeMount("/dev/lxd")
+						err = d.RemoveMount("/dev/lxd")
 						if err != nil {
 							return err
 						}
@@ -4538,13 +4486,37 @@ func (d *lxc) Export(w io.Writer, properties map[string]string, expiration time.
 		return nil
 	}
 
-	// Parse the metadata file.
-	fnam := filepath.Join(cDir, "metadata.yaml")
-	existingMetadata, err := ParseImageMetadataFile(fnam)
+	instanceRoot, err := d.OpenRoot()
+	if err != nil {
+		_ = tarWriter.Close()
+		d.logger.Error("Failed exporting instance", ctxMap)
+		return meta, err
+	}
+
+	defer func() { _ = instanceRoot.Close() }()
+
+	metadataFile, err := instanceRoot.Open("metadata.yaml")
 	if err != nil && !errors.Is(err, fs.ErrNotExist) {
 		_ = tarWriter.Close()
 		d.logger.Error("Failed exporting instance", ctxMap)
 		return meta, err
+	}
+
+	var fnam string
+	var existingMetadata *api.ImageMetadata
+
+	if metadataFile != nil {
+		defer func() { _ = metadataFile.Close() }()
+
+		// Parse the metadata file.
+		existingMetadata, err = ParseImageMetadataFile(metadataFile)
+		if err != nil {
+			_ = tarWriter.Close()
+			d.logger.Error("Failed exporting instance", ctxMap)
+			return meta, err
+		}
+
+		fnam = filepath.Join(instanceRoot.Name(), "metadata.yaml")
 	}
 
 	if existingMetadata == nil {
@@ -4613,8 +4585,7 @@ func (d *lxc) Export(w io.Writer, properties map[string]string, expiration time.
 			return meta, err
 		}
 
-		tmpOffset := len(path.Dir(fnam)) + 1
-		err = tarWriter.WriteFile(fnam[tmpOffset:], fnam, fi, false)
+		err = tarWriter.WriteFile("metadata.yaml", fnam, fi, false)
 		if err != nil {
 			_ = tarWriter.Close()
 			d.logger.Debug("Error writing to tarfile", logger.Ctx{"err": err})
@@ -4661,7 +4632,13 @@ func (d *lxc) Export(w io.Writer, properties map[string]string, expiration time.
 		}
 
 		// Include metadata.yaml in the tarball.
-		fi, err := os.Lstat(fnam)
+		var fi fs.FileInfo
+		if properties != nil || !expiration.IsZero() {
+			fi, err = os.Lstat(fnam)
+		} else {
+			fi, err = metadataFile.Stat()
+		}
+
 		if err != nil {
 			_ = tarWriter.Close()
 			d.logger.Debug("Error statting during export", logger.Ctx{"fileName": fnam})
@@ -4669,13 +4646,8 @@ func (d *lxc) Export(w io.Writer, properties map[string]string, expiration time.
 			return meta, err
 		}
 
-		if properties != nil || !expiration.IsZero() {
-			tmpOffset := len(path.Dir(fnam)) + 1
-			err = tarWriter.WriteFile(fnam[tmpOffset:], fnam, fi, false)
-		} else {
-			err = tarWriter.WriteFile(fnam[offset:], fnam, fi, false)
-		}
-
+		// In both sub-cases the desired tar entry name is always "metadata.yaml".
+		err = tarWriter.WriteFile("metadata.yaml", fnam, fi, false)
 		if err != nil {
 			_ = tarWriter.Close()
 			d.logger.Debug("Error writing to tarfile", logger.Ctx{"err": err})
@@ -5480,13 +5452,27 @@ func (d *lxc) ConversionReceive(args instance.ConversionReceiveArgs, progressRep
 }
 
 func (d *lxc) templateApplyNow(trigger instance.TemplateTrigger) error {
-	// If there's no metadata, just return.
-	metadata, err := ParseImageMetadataFile(filepath.Join(d.Path(), "metadata.yaml"))
+	instanceRoot, err := d.OpenRoot()
+	if err != nil {
+		return err
+	}
+
+	defer func() { _ = instanceRoot.Close() }()
+
+	metadataFile, err := instanceRoot.Open("metadata.yaml")
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			return nil
 		}
 
+		return err
+	}
+
+	defer func() { _ = metadataFile.Close() }()
+
+	// If there's no metadata, just return.
+	metadata, err := ParseImageMetadataFile(metadataFile)
+	if err != nil {
 		return fmt.Errorf("Failed reading metadata: %w", err)
 	}
 
@@ -5557,17 +5543,7 @@ func (d *lxc) templateApplyNow(trigger instance.TemplateTrigger) error {
 
 	defer func() { _ = templatesRoot.Close() }()
 
-	securityChecks := func(path string, templateFile string) error {
-		// Ensure the path is within the container rootfs.
-		pathStat, err := rootfsRoot.Stat(path)
-		if err != nil && !errors.Is(err, fs.ErrNotExist) {
-			return fmt.Errorf("Could not stat target path %q in container rootfs: %w", path, err)
-		}
-
-		if err == nil && pathStat.IsDir() {
-			return fmt.Errorf("Template target path %q is a directory, not a regular file", path)
-		}
-
+	checkTemplateSource := func(templateFile string) error {
 		tplFileStat, err := templatesRoot.Lstat(templateFile)
 		if err != nil {
 			return fmt.Errorf("Could not access template file: %w", err)
@@ -5587,45 +5563,42 @@ func (d *lxc) templateApplyNow(trigger instance.TemplateTrigger) error {
 
 			// Check if the template should be applied now
 			found := slices.Contains(tpl.When, string(trigger))
-
 			if !found {
 				return nil
 			}
 
-			relPath := strings.TrimLeft(tplPath, "/")
-
-			// Perform some security checks.
-			err = securityChecks(relPath, tpl.Template)
+			// Perform security checks on the template source file.
+			err := checkTemplateSource(tpl.Template)
 			if err != nil {
 				return fmt.Errorf("Template security check failed for %q: %w", tplPath, err)
 			}
 
-			// Open the file to template, create if needed
-			fullpath := filepath.Join(rootfsRoot.Name(), relPath)
-			if shared.PathExists(fullpath) {
-				if tpl.CreateOnly {
-					return nil
-				}
+			// Convert to relative path and clean.
+			relPath := path.Clean(strings.TrimLeft(tplPath, "/"))
+			if relPath == "." {
+				return fmt.Errorf("Invalid template target path %q", tplPath)
+			}
 
-				// Open the existing file
-				w, err = os.Create(fullpath)
-				if err != nil {
-					return fmt.Errorf("Failed creating template file: %w", err)
-				}
-			} else {
-				// Create the directories leading to the file
-				err = shared.MkdirAllOwner(path.Dir(fullpath), 0755, int(rootUID), int(rootGID))
-				if err != nil {
-					return err
-				}
-
-				// Create the file itself
-				w, err = os.Create(fullpath)
+			// Atomically create the target file if it doesn't already exist. Using
+			// O_CREATE|O_EXCL lets us determine existence at open time without a
+			// separate stat, avoiding a time-of-check to time-of-use race. The
+			// enclosing *os.Root prevents the path from escaping the container rootfs.
+			w, err = rootfsRoot.OpenFile(relPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0644)
+			if errors.Is(err, fs.ErrNotExist) {
+				// A parent directory is missing, create the tree and retry.
+				err = filesystem.MkdirAllOwner(rootfsRoot, path.Dir(relPath), 0755, int(rootUID), int(rootGID))
 				if err != nil {
 					return err
 				}
 
-				// Fix ownership and mode
+				w, err = rootfsRoot.OpenFile(relPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0644)
+			}
+
+			switch {
+			case err == nil:
+				defer func() { _ = w.Close() }()
+
+				// The file was newly created, fix ownership and mode.
 				err = w.Chown(int(rootUID), int(rootGID))
 				if err != nil {
 					return err
@@ -5635,8 +5608,29 @@ func (d *lxc) templateApplyNow(trigger instance.TemplateTrigger) error {
 				if err != nil {
 					return err
 				}
+
+			case errors.Is(err, fs.ErrExist):
+				// The target already exists.
+				if tpl.CreateOnly {
+					return nil
+				}
+
+				// Open the existing file for writing, truncating it. Opening a
+				// directory for writing fails atomically with EISDIR.
+				w, err = rootfsRoot.OpenFile(relPath, os.O_WRONLY|os.O_TRUNC, 0)
+				if err != nil {
+					if errors.Is(err, syscall.EISDIR) {
+						return fmt.Errorf("Template target path %q is a directory, not a regular file", tplPath)
+					}
+
+					return fmt.Errorf("Failed opening template file %q: %w", tplPath, err)
+				}
+
+				defer func() { _ = w.Close() }()
+
+			default:
+				return fmt.Errorf("Failed creating template file %q: %w", tplPath, err)
 			}
-			defer func() { _ = w.Close() }()
 
 			// Read the template
 			tplString, err := templatesRoot.ReadFile(tpl.Template)
@@ -5753,6 +5747,13 @@ func (d *lxc) fileSFTPConnNoLock() (net.Conn, error) {
 	if err != nil {
 		return nil, err
 	}
+
+	// Prevent Close() from unlinking the listener socket path. net.UnixListener.Close() normally calls
+	// syscall.Unlink on the path it was created with (here a /proc/self/fd/<N>/... path), which can end up
+	// unlinking the wrong instance's socket if that fd number gets reused after this function returns.
+	// Stale sockets are cleaned up by the next caller's os.Remove (above) before it creates its own socket.
+	// Failure cleanup is handled by the revert's explicit os.Remove below.
+	forkfileListener.SetUnlinkOnClose(false)
 
 	revert.Add(func() {
 		_ = forkfileListener.Close()
@@ -5883,11 +5884,13 @@ func (d *lxc) fileSFTPConnNoLock() (net.Conn, error) {
 			return
 		}
 
-		// Close the listener and delete the socket immediately after forkfile exits to avoid clients
-		// thinking a listener is available while other deferred calls are being processed.
+		// Close the listener after forkfile exits. The socket file is intentionally not
+		// deleted here: SetUnlinkOnClose(false) prevents Close() from unlinking it, and
+		// no explicit os.Remove is done either, because a concurrent fileSFTPConnNoLock
+		// call may have already created a new socket at forkfilePath. Stale sockets are
+		// cleaned up by the next caller's os.Remove before it creates its own socket.
 		defer func() {
 			_ = forkfileListener.Close()
-			_ = os.Remove(forkfilePath)
 			_ = os.Remove(pidFile)
 		}()
 
@@ -6644,7 +6647,10 @@ func (d *lxc) insertMountLXC(source, target, fstype string, flags int) error {
 	return nil
 }
 
-func (d *lxc) moveMount(source, target, fstype string, flags int, idmapType idmap.IdmapStorageType) error {
+// MoveMount attaches source onto target inside the running container using
+// move_mount, without going through the /dev/.lxd-mounts staging area that
+// insertMountLXC and insertMountLXD rely on.
+func (d *lxc) MoveMount(source, target, fstype string, flags int, idmapType idmap.IdmapStorageType) error {
 	// Get the init PID
 	pid := d.InitPID()
 	if pid == -1 {
@@ -6692,8 +6698,10 @@ func (d *lxc) moveMount(source, target, fstype string, flags int, idmapType idma
 }
 
 func (d *lxc) insertMount(source, target, fstype string, flags int, idmapType idmap.IdmapStorageType) error {
-	if d.state.OS.IdmappedMounts && idmapType == idmap.IdmapStorageIdmapped {
-		return d.moveMount(source, target, fstype, flags, idmapType)
+	// Prefer open_tree()/move_mount() whenever the kernel supports it (which
+	// d.state.OS.IdmappedMounts establishes)
+	if d.state.OS.IdmappedMounts {
+		return d.MoveMount(source, target, fstype, flags, idmapType)
 	}
 
 	if idmapType == idmap.IdmapStorageNone {
@@ -6703,7 +6711,8 @@ func (d *lxc) insertMount(source, target, fstype string, flags int, idmapType id
 	return d.insertMountLXD(source, target, fstype, flags, -1, idmapType)
 }
 
-func (d *lxc) removeMount(mount string) error {
+// RemoveMount unmounts the given path inside the running container.
+func (d *lxc) RemoveMount(mount string) error {
 	// Get the init PID
 	pid := d.InitPID()
 	if pid == -1 {
@@ -6967,7 +6976,7 @@ func (d *lxc) CanMigrate() (canMigrate bool, live bool) {
 	return d.canMigrate(d)
 }
 
-// LockExclusive attempts to get exlusive access to the instance's root volume.
+// LockExclusive attempts to get exclusive access to the instance's root volume.
 func (d *lxc) LockExclusive() (*operationlock.InstanceOperation, error) {
 	if d.IsRunning() {
 		return nil, errors.New("Instance is running")
@@ -7579,7 +7588,7 @@ func (d *lxc) loadRawLXCConfig(cc *liblxc.Container) error {
 	return nil
 }
 
-// forfileRunningLockName returns the forkfile-running_ID lock name.
+// forkfileRunningLockName returns the forkfile-running_ID lock name.
 func (d *common) forkfileRunningLockName() string {
 	return "forkfile-running_" + strconv.FormatInt(int64(d.id), 10)
 }

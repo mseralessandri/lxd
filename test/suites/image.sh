@@ -264,6 +264,270 @@ test_image_import_existing_alias() {
     lxc image delete newimage image2
 }
 
+test_image_import_metadata() {
+  local tmpDir imgDir imgTar out
+
+  sub_test "Reject metadata.yaml that is a symlink pointing outside the archive"
+
+  tmpDir=$(mktemp -d -p "${TEST_DIR}" XXX)
+  imgDir="${tmpDir}/image"
+  imgTar="${tmpDir}/image.tar"
+
+  mkdir -p "${imgDir}/rootfs"
+
+  # Create metadata.yaml as a symlink pointing outside the archive.
+  ln -s "/etc/hostname" "${imgDir}/metadata.yaml"
+
+  tar -cf "${imgTar}" -C "${imgDir}" .
+
+  out="$(! lxc image import "${imgTar}" 2>&1 || false)"
+  echo "${out}" | grep -F 'Error: Cannot read non-regular file "./metadata.yaml"'
+
+  # Check the list of images is empty.
+  [ "$(lxc image list -f csv -c f | wc -l)" -eq 0 ]
+
+  rm -rf "${tmpDir}"
+}
+
+test_image_metadata_confined() {
+  local ct_name err_msg start_err_msg vm_name
+  local ct_meta_path vm_meta_path
+
+  ct_name="c1"
+
+  # The full error the client receives from any confined os.Root operation on the escaping symlink.
+  err_msg="Error: openat metadata.yaml: path escapes from parent"
+  start_err_msg="Error: Failed applying template: openat metadata.yaml: path escapes from parent"
+
+  ensure_import_testimage
+
+  # Plant an unconfined metadata.yaml file into the container's drive whilst it is mounted.
+  lxc init testimage "${ct_name}"
+  lxc start "${ct_name}"
+  # shellcheck disable=2153
+  ct_meta_path="$(realpath "${LXD_DIR}/containers/${ct_name}/metadata.yaml")"
+  rm -f "${ct_meta_path}"
+  ln -s /etc/hostname "${ct_meta_path}"
+  lxc stop -f "${ct_name}"
+
+  # instanceMetadataGet (os.Root.Open): GET /1.0/instances/<name>/metadata.
+  sub_test "Reject reading metadata.yaml symlink escaping the instance root on show"
+  [ "$(! "${_LXC}" config metadata show "${ct_name}" 2>&1 1>/dev/null || false)" = "${err_msg}" ]
+
+  # instanceMetadataPatch (os.Root.Open): PATCH /1.0/instances/<name>/metadata.
+  sub_test "Reject reading metadata.yaml symlink escaping the instance root on patch"
+  [ "$(! "${_LXC}" query -X PATCH -d '{"properties": {"os": "test"}}' "/1.0/instances/${ct_name}/metadata" 2>&1 1>/dev/null || false)" = "${err_msg}" ]
+
+  # doInstanceMetadataUpdate (os.Root.WriteFile): PUT /1.0/instances/<name>/metadata.
+  sub_test "Reject writing metadata.yaml symlink escaping the instance root on update"
+  [ "$(! "${_LXC}" query -X PUT -d '{"architecture": "'"$(uname -m)"'", "creation_date": 1}' "/1.0/instances/${ct_name}/metadata" 2>&1 1>/dev/null || false)" = "${err_msg}" ]
+
+  # lxc.Export (os.Root.Open): publishing the instance as an image reads its metadata.
+  sub_test "Reject reading metadata.yaml symlink escaping the container root on publish"
+  [ "$(! "${_LXC}" publish "${ct_name}" 2>&1 1>/dev/null || false)" = "${err_msg}" ]
+
+  # lxc.templateApplyNow (os.Root.Open): starting the instance triggers templating which should be rejected.
+  sub_test "Reject starting the instance whose metadata.yaml symlink escapes the instance root"
+  if lxc start "${ct_name}"; then
+    echo "ERROR: start must have been rejected"
+    exit 1
+  fi
+
+  lxc delete -f "${ct_name}"
+
+  # Also check VMs.
+  if [ "${LXD_VM_TESTS}" != "0" ]; then
+    vm_name="v1"
+
+    # Plant an unconfined metadata.yaml file into the VM's config drive whilst it is mounted.
+    lxc init "${vm_name}" --vm --empty --config limits.memory=384MiB
+    lxc start "${vm_name}"
+    vm_meta_path="$(realpath "${LXD_DIR}/virtual-machines/${vm_name}/metadata.yaml")"
+    rm -f "${vm_meta_path}"
+    ln -s /etc/hostname "${vm_meta_path}"
+    lxc stop -f "${vm_name}"
+
+    # qemu.Export (os.Root.Open): publishing the stopped VM reads its metadata.
+    sub_test "Reject reading metadata.yaml symlink escaping the VM root on publish"
+    [ "$(! "${_LXC}" publish "${vm_name}" 2>&1 1>/dev/null || false)" = "${err_msg}" ]
+
+    # qemu.templateApplyNow (os.Root.Open) is only reachable when the VM is started.
+    sub_test "Reject starting the VM whose metadata.yaml symlink escapes the instance root"
+    [ "$(! "${_LXC}" start "${vm_name}" 2>&1 1>/dev/null || false)" = "${start_err_msg}
+Try \`lxc info --show-log ${vm_name}\` for more info" ]
+
+    lxc delete -f "${vm_name}"
+  fi
+
+  lxc image delete testimage
+}
+
+test_image_metadata_template_target_confined() {
+  local ct_name target_dir target_file target_content escaping_path
+
+  ensure_import_testimage
+
+  ct_name="c1"
+
+  # A root-owned file living clearly outside of any instance root. If the
+  # confinement is bypassed, template application would overwrite it.
+  target_dir="$(mktemp -d -p "${TEST_DIR}" XXX)"
+  target_file="${target_dir}/ROOT_OWNED_TARGET"
+  target_content="legitimate root-owned system file"
+  printf '%s\n' "${target_content}" > "${target_file}"
+  chown root:root "${target_file}"
+  chmod 0600 "${target_file}"
+
+  # The template target path uses a bogus first component followed by enough
+  # ".." segments to climb above the instance rootfs and land on the absolute
+  # path of the root-owned file. The confined os.Root must reject this before
+  # the escaping path can be opened.
+  escaping_path="/nonexistent/../../../../../../../../../../../../..${target_file}"
+
+  lxc init testimage "${ct_name}"
+
+  sub_test "Upload a template file to the instance via the metadata templates API"
+  printf '#!/bin/sh\n# OVERWRITTEN VIA LXD TEMPLATE ESCAPE\nexit 0\n' \
+    | curl --silent --fail --unix-socket "${LXD_DIR}/unix.socket" -X POST \
+      -H "Content-Type: application/octet-stream" --data-binary @- \
+      "lxd/1.0/instances/${ct_name}/metadata/templates?path=escape.tpl" \
+    | jq --exit-status '.status_code == 200'
+
+  sub_test "Register a template whose target path escapes the instance root"
+  "${_LXC}" query -X PUT -d "{\"architecture\": \"$(uname -m)\", \"creation_date\": 1, \"properties\": {}, \"templates\": {\"${escaping_path}\": {\"when\": [\"start\"], \"create_only\": false, \"template\": \"escape.tpl\", \"properties\": {}}}}" "/1.0/instances/${ct_name}/metadata"
+
+  # templateApplyNow (os.Root.OpenFile): starting the instance applies "start"
+  # templates. The escaping target must be rejected rather than followed out of
+  # the instance root. The container start hook surfaces only a generic failure
+  # to the client, so assert that start fails and check the instance start log
+  # for the confinement error before confirming the root-owned file was left
+  # untouched.
+  sub_test "Reject starting the instance whose template target escapes the instance root"
+  if lxc start "${ct_name}"; then
+    echo "ERROR: start must have been rejected"
+    exit 1
+  fi
+
+  sub_test "Confirm the daemon log reports the template confinement error"
+  # The daemon shares one logrus formatter between stderr and the logfile, and it enables colors
+  # whenever stderr is a terminal. That embeds ANSI escape codes around the field keys in lxd.log
+  # (e.g. instance=/project=), so strip them before matching the confinement error.
+  sed 's/\x1b\[[0-9;]*m//g' "${LXD_DIR}/lxd.log" | grep -F "ROOT_OWNED_TARGET: path escapes from parent\" instance=${ct_name} project=default" >/dev/null
+
+  sub_test "Confirm the root-owned file outside the instance root was not modified"
+  [ "$(cat "${target_file}")" = "${target_content}" ]
+
+  lxc delete -f "${ct_name}"
+
+  # Also check VMs. The QEMU driver renders each template to "<template>.out"
+  # inside the config drive, so the attacker-influenced value is the template
+  # source name rather than the map key. A root-owned target file ending in
+  # ".out" is planted so that the escaping source name resolves onto it.
+  # templateApplyNow (os.Root.OpenFile) is only reached when the VM is started,
+  # so gate it with LXD_VM_TESTS.
+  if [ "${LXD_VM_TESTS}" != "0" ]; then
+    local vm_name vm_target_file vm_target_content vm_escaping_template
+    vm_name="v1"
+    vm_target_file="${target_dir}/VM_ROOT_OWNED_TARGET.out"
+    vm_target_content="legitimate root-owned system file for VM"
+    printf '%s\n' "${vm_target_content}" > "${vm_target_file}"
+    chown root:root "${vm_target_file}"
+    chmod 0600 "${vm_target_file}"
+
+    # The QEMU driver appends ".out" to the template source name, so point the
+    # escaping source name at the target file with the ".out" suffix stripped.
+    vm_escaping_template="/nonexistent/../../../../../../../../../../../../..${target_dir}/VM_ROOT_OWNED_TARGET"
+
+    lxc init "${vm_name}" --vm --empty --config limits.memory=384MiB
+
+    sub_test "Register a VM template whose source name escapes the instance root"
+    "${_LXC}" query -X PUT -d "{\"architecture\": \"$(uname -m)\", \"creation_date\": 1, \"properties\": {}, \"templates\": {\"escape.tpl\": {\"when\": [\"start\"], \"create_only\": false, \"template\": \"${vm_escaping_template}\", \"properties\": {}}}}" "/1.0/instances/${vm_name}/metadata"
+
+    sub_test "Reject starting the VM whose template source escapes the instance root"
+    if lxc start "${vm_name}"; then
+      echo "ERROR: start must have been rejected"
+      exit 1
+    fi
+
+    sub_test "Confirm the daemon log reports the VM template confinement error"
+    sed 's/\x1b\[[0-9;]*m//g' "${LXD_DIR}/lxd.log" | grep -F "VM_ROOT_OWNED_TARGET.out: path escapes from parent" >/dev/null
+
+    sub_test "Confirm the root-owned file outside the VM root was not modified"
+    [ "$(cat "${vm_target_file}")" = "${vm_target_content}" ]
+
+    lxc delete -f "${vm_name}"
+  fi
+
+  lxc image delete testimage
+  rm -rf "${target_dir}"
+}
+
+test_image_backup_confined() {
+  local ct_name ct_backup_path err_msg pool_driver pool_name
+
+  ct_name="c1"
+  err_msg="openat backup.yaml: path escapes from parent"
+
+  ensure_import_testimage
+
+  # Plant an unconfined backup.yaml file into the container's drive whilst it is mounted.
+  lxc init testimage "${ct_name}"
+  lxc start "${ct_name}"
+  ct_backup_path="$(realpath "${LXD_DIR}/containers/${ct_name}/backup.yaml")"
+  mv "${ct_backup_path}" "${ct_backup_path}.backup"
+  ln -s /etc/hostname "${ct_backup_path}"
+  lxc stop -f "${ct_name}"
+
+  # UpdateInstanceBackupFile (os.Root.WriteFile): starting the instance rewrites backup.yaml just
+  # before the instance process starts, so a symlinked backup.yaml must not be followed outside
+  # the instance's storage volume.
+  sub_test "Reject writing backup.yaml symlink escaping the instance root on start"
+  [[ "$(lxc start "${ct_name}" 2>&1 || false)" == *"${err_msg}"* ]]
+
+  # UpdateInstanceBackupFile (os.Root.WriteFile): creating a snapshot also rewrites backup.yaml.
+  sub_test "Reject writing backup.yaml symlink escaping the instance root on snapshot create"
+  [[ "$(lxc snapshot "${ct_name}" snap0 2>&1 || false)" == *"${err_msg}"* ]]
+
+  # Only test with the dir driver as we can easily cleanup after corrupting the container.
+  pool_name="$(lxc profile device get default root pool)"
+  pool_driver="$(lxc storage show "${pool_name}" | awk '/^driver:/ {print $2}')"
+  if [ "${pool_driver}" = "dir" ]; then
+    # Remove the instance and its storage volume DB records so recovery treats the volume as
+    # unknown and attempts to parse its (symlinked) backup.yaml.
+    lxd sql global "PRAGMA foreign_keys=ON; DELETE FROM instances WHERE name='c1'"
+    lxd sql global "PRAGMA foreign_keys=ON; DELETE FROM storage_volumes WHERE name='c1'"
+
+    # detectUnknownInstanceVolume/ParseConfigYamlFile (os.Root.ReadFile): recovery reads
+    # backup.yaml from within the volume's mount path. A symlink escaping the volume must be
+    # rejected rather than followed, and recovery of this instance must fail rather than
+    # silently leaking the symlink target's contents into a recovered instance record.
+    if out=$(cat <<EOF | lxd recover 2>&1
+yes
+yes
+EOF
+    ); then
+      echo "ERROR: lxd recover unexpectedly succeeded despite backup.yaml escaping the volume" >&2
+      exit 1
+    fi
+
+    [[ "${out}" == *"${err_msg}"* ]]
+
+    # At this stage the container is broken.
+    # Fix the backup.yaml manually.
+    rm -rf "${LXD_DIR}/storage-pools/${pool_name}/containers/${ct_name}/backup.yaml"
+    mv "${ct_backup_path}.backup" "${ct_backup_path}"
+
+    # Now recover the container.
+    cat <<EOF | lxd recover
+yes
+yes
+EOF
+  fi
+
+  lxc delete -f "${ct_name}"
+  lxc image delete testimage
+}
+
 test_image_refresh() {
   local LXD2_DIR LXD2_ADDR
   LXD2_DIR=$(mktemp -d -p "${TEST_DIR}" XXX)
@@ -825,4 +1089,45 @@ test_image_with_exec_output_symlink() {
   lxc image delete image-repack
 
   rm -rf "${tmpDir}"
+}
+
+test_image_import_metadata_not_regular_file() {
+  local tmpDir imgDir imgTar out
+
+  sub_test "Reject metadata that is overridden with a non-regular file when unpacking into an instance volume"
+
+  for m in metadata.yaml backup.yaml; do
+    tmpDir=$(mktemp -d -p "${TEST_DIR}" XXX)
+    imgDir="${tmpDir}/image"
+    imgTar="${tmpDir}/image.tar"
+
+    # Build an image tarball with a valid metadata.yaml.
+    # The metadata.yaml always has to be present.
+    mkdir -p "${imgDir}/rootfs"
+    printf '%s\n' "architecture: $(uname -m)" "creation_date: 1" > "${imgDir}/metadata.yaml"
+    tar -cf "${imgTar}" -C "${imgDir}" .
+
+    # Append the non-regular metadata file to the archive.
+    # In case of the metadata.yaml, this will allow importing the image as the first regular metadata.yaml passes the checks.
+    # But the second metadata.yaml will persist on the filesystem after unpacking the image which will trigger the error below.
+    if [ ! "${m}" = "backup.yaml" ]; then
+        # As the metadata.yaml is always present, remove it before creating the symlink with the same name.
+        rm "${imgDir}/${m}"
+    fi
+    ln -s "/etc/hostname" "${imgDir}/${m}"
+    tar -f "${imgTar}" --append -C "${imgDir}" "./${m}"
+
+    lxc image import "${imgTar}" --alias image-invalid-metadata
+
+    # Unpacking the image into the instance's storage volume must reject the non-regular metadata file.
+    if out=$(lxc init image-invalid-metadata c1 2>&1); then
+        echo "ERROR: Initializing an instance from an image with a non-regular metadata file unexpectedly succeeded" >&2
+        exit 1
+    fi
+
+    echo "${out}" | grep -qF "is not a regular file"
+
+    lxc image delete image-invalid-metadata
+    rm -rf "${tmpDir}"
+  done
 }

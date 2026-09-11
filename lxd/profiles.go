@@ -35,16 +35,18 @@ import (
 )
 
 var profilesCmd = APIEndpoint{
-	Path:        "profiles",
-	MetricsType: entity.TypeProfile,
+	Path:            "profiles",
+	MetricsType:     entity.TypeProfile,
+	ProjectSpecific: true,
 
-	Get:  APIEndpointAction{Handler: profilesGet, AccessHandler: allowProjectResourceList(false)},
-	Post: APIEndpointAction{Handler: profilesPost, AccessHandler: allowPermission(entity.TypeProject, auth.EntitlementCanCreateProfiles)},
+	Get:  APIEndpointAction{Handler: profilesGet, AccessHandler: allowAuthenticated, AllProjectsMode: allProjectsModeDisallowRestrictedTLSClients},
+	Post: APIEndpointAction{Handler: profilesPost, AccessHandler: profileAccessHandler(auth.EntitlementCanCreateProfiles)},
 }
 
 var profileCmd = APIEndpoint{
-	Path:        "profiles/{name}",
-	MetricsType: entity.TypeProfile,
+	Path:            "profiles/{name}",
+	MetricsType:     entity.TypeProfile,
+	ProjectSpecific: true,
 
 	Delete: APIEndpointAction{Handler: profileDelete, AccessHandler: profileAccessHandler(auth.EntitlementCanDelete)},
 	Get:    APIEndpointAction{Handler: profileGet, AccessHandler: profileAccessHandler(auth.EntitlementCanView)},
@@ -63,41 +65,32 @@ type profileDetails struct {
 	effectiveProject api.Project
 }
 
-// addProfileDetailsToRequestContext sets the effective project in the request.Info and sets ctxProfileDetails (profileDetails)
-// in the request context.
-func addProfileDetailsToRequestContext(s *state.State, r *http.Request) error {
-	profileName := r.PathValue("name")
-	requestProjectName := request.ProjectParam(r)
-	effectiveProject, err := project.ProfileProject(s.DB.Cluster, requestProjectName)
-	if err != nil {
-		return fmt.Errorf("Failed checking project %q profile feature: %w", requestProjectName, err)
-	}
-
-	request.SetContextValue(r, request.CtxEffectiveProjectName, effectiveProject.Name)
-	request.SetContextValue(r, ctxProfileDetails, profileDetails{
-		profileName:      profileName,
-		effectiveProject: *effectiveProject,
-	})
-
-	return nil
-}
-
-// profileAccessHandler calls addProfileDetailsToRequestContext, then uses the details to perform an access check with
-// the given auth.Entitlement.
 func profileAccessHandler(entitlement auth.Entitlement) func(d *Daemon, r *http.Request) response.Response {
 	return func(d *Daemon, r *http.Request) response.Response {
 		s := d.State()
-		err := addProfileDetailsToRequestContext(s, r)
+		requestProjectName := request.ProjectParam(r)
+		effectiveProject, err := project.ProfileProject(s.DB.Cluster, requestProjectName)
 		if err != nil {
-			return response.SmartError(err)
+			return response.InternalError(fmt.Errorf("Failed checking project %q profile feature: %w", requestProjectName, err))
 		}
 
-		details, err := request.GetContextValue[profileDetails](r.Context(), ctxProfileDetails)
-		if err != nil {
-			return response.SmartError(err)
+		request.SetContextValue(r, request.CtxEffectiveProjectName, effectiveProject.Name)
+
+		var u *api.URL
+		switch entitlement {
+		case auth.EntitlementCanCreateProfiles:
+			u = entity.ProjectURL(effectiveProject.Name)
+		default:
+			profileName := r.PathValue("name")
+			u = entity.ProfileURL(effectiveProject.Name, profileName)
+
+			request.SetContextValue(r, ctxProfileDetails, profileDetails{
+				profileName:      profileName,
+				effectiveProject: *effectiveProject,
+			})
 		}
 
-		err = s.Authorizer.CheckPermission(r.Context(), entity.ProfileURL(request.ProjectParam(r), details.profileName), entitlement)
+		err = s.Authorizer.CheckPermission(r.Context(), u, entitlement)
 		if err != nil {
 			return response.SmartError(err)
 		}
@@ -272,7 +265,8 @@ func profilesGet(d *Daemon, r *http.Request) response.Response {
 
 			apiProfiles = make([]*api.Profile, 0, len(profiles))
 			for _, profile := range profiles {
-				if !userHasPermission(entity.ProfileURL(requestProjectName, profile.Name)) {
+				profileURL := entity.ProfileURL(profile.Project, profile.Name)
+				if !userHasPermission(profileURL) {
 					continue
 				}
 
@@ -287,14 +281,18 @@ func profilesGet(d *Daemon, r *http.Request) response.Response {
 				}
 
 				apiProfiles = append(apiProfiles, apiProfile)
-				urlToProfile[entity.ProfileURL(requestProjectName, profile.Name)] = apiProfile
+				urlToProfile[profileURL] = apiProfile
 			}
 		} else {
 			profileURLs = make([]string, 0, len(profiles))
 			for _, profile := range profiles {
-				profileURL := entity.ProfileURL(requestProjectName, profile.Name)
+				profileURL := entity.ProfileURL(profile.Project, profile.Name)
 				if userHasPermission(profileURL) {
-					profileURLs = append(profileURLs, profileURL.String())
+					if allProjects {
+						profileURLs = append(profileURLs, profileURL.String())
+					} else {
+						profileURLs = append(profileURLs, entity.ProfileURL(requestProjectName, profile.Name).String())
+					}
 				}
 			}
 		}
@@ -622,7 +620,7 @@ func profilePut(d *Daemon, r *http.Request) response.Response {
 			ProjectName: requestProjectName,
 			EntityURL:   api.NewURL().Path(version.APIVersion, "profiles", details.profileName).Project(details.effectiveProject.Name),
 			Type:        operationtype.ProfileUpdate,
-			Class:       operations.OperationClassTask,
+			Class:       operationtype.OperationClassTask,
 			RunHook:     run,
 		}
 
@@ -631,7 +629,7 @@ func profilePut(d *Daemon, r *http.Request) response.Response {
 			return response.InternalError(err)
 		}
 
-		return operations.OperationResponse(op)
+		return response.OperationResponse(op)
 	}
 
 	var profile *api.Profile
@@ -703,7 +701,7 @@ func profilePut(d *Daemon, r *http.Request) response.Response {
 		ProjectName: requestProjectName,
 		EntityURL:   profileURL,
 		Type:        operationtype.ProfileUpdate,
-		Class:       operations.OperationClassTask,
+		Class:       operationtype.OperationClassTask,
 		RunHook:     run,
 	}
 
@@ -712,7 +710,7 @@ func profilePut(d *Daemon, r *http.Request) response.Response {
 		return response.InternalError(err)
 	}
 
-	return operations.OperationResponse(op)
+	return response.OperationResponse(op)
 }
 
 // swagger:operation PATCH /1.0/profiles/{name} profiles profile_patch
@@ -844,7 +842,7 @@ func profilePatch(d *Daemon, r *http.Request) response.Response {
 		ProjectName: requestProjectName,
 		EntityURL:   api.NewURL().Path(version.APIVersion, "profiles", details.profileName).Project(details.effectiveProject.Name),
 		Type:        operationtype.ProfileUpdate,
-		Class:       operations.OperationClassTask,
+		Class:       operationtype.OperationClassTask,
 		RunHook:     run,
 	}
 
@@ -853,7 +851,7 @@ func profilePatch(d *Daemon, r *http.Request) response.Response {
 		return response.InternalError(err)
 	}
 
-	return operations.OperationResponse(op)
+	return response.OperationResponse(op)
 }
 
 // swagger:operation POST /1.0/profiles/{name} profiles profile_post

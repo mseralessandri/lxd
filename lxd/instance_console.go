@@ -488,7 +488,7 @@ func instanceConsolePost(d *Daemon, r *http.Request) response.Response {
 			return response.SmartError(err)
 		}
 
-		return operations.ForwardedOperationResponse(opAPI)
+		return response.ForwardedOperationResponse(opAPI)
 	}
 
 	if post.Type == "" {
@@ -543,7 +543,7 @@ func instanceConsolePost(d *Daemon, r *http.Request) response.Response {
 		ProjectName: projectName,
 		EntityURL:   instanceURL,
 		Type:        operationtype.ConsoleShow,
-		Class:       operations.OperationClassWebsocket,
+		Class:       operationtype.OperationClassWebsocket,
 		Metadata:    ws.Metadata(),
 		RunHook:     ws.Do,
 		ConnectHook: ws.Connect,
@@ -554,7 +554,7 @@ func instanceConsolePost(d *Daemon, r *http.Request) response.Response {
 		return response.InternalError(err)
 	}
 
-	return operations.OperationResponse(op)
+	return response.OperationResponse(op)
 }
 
 // swagger:operation GET /1.0/instances/{name}/console instances instance_console_get
@@ -591,30 +591,9 @@ func instanceConsolePost(d *Daemon, r *http.Request) response.Response {
 func instanceConsoleLogGet(d *Daemon, r *http.Request) response.Response {
 	s := d.State()
 
-	instanceType, err := urlInstanceTypeDetect(r)
-	if err != nil {
-		return response.SmartError(err)
-	}
-
-	projectName := request.ProjectParam(r)
-	name := r.PathValue("name")
-	if shared.IsSnapshot(name) {
-		return response.BadRequest(errors.New("Invalid instance name"))
-	}
-
-	// Forward the request if the container is remote.
-	resp, err := forwardedResponseIfInstanceIsRemote(r.Context(), s, projectName, name, instanceType)
-	if err != nil {
-		return response.SmartError(err)
-	}
-
+	inst, _, _, resp := forwardedInstanceResponseWithInstance(s, r)
 	if resp != nil {
 		return resp
-	}
-
-	inst, err := instance.LoadByProjectAndName(s, projectName, name)
-	if err != nil {
-		return response.SmartError(err)
 	}
 
 	if inst.Type() != instancetype.Container {

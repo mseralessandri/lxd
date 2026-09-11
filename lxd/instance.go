@@ -14,6 +14,7 @@ import (
 	"github.com/canonical/lxd/lxd/db"
 	dbCluster "github.com/canonical/lxd/lxd/db/cluster"
 	"github.com/canonical/lxd/lxd/db/operationtype"
+	deviceConfig "github.com/canonical/lxd/lxd/device/config"
 	"github.com/canonical/lxd/lxd/instance"
 	"github.com/canonical/lxd/lxd/instance/instancetype"
 	"github.com/canonical/lxd/lxd/instance/operationlock"
@@ -21,7 +22,6 @@ import (
 	"github.com/canonical/lxd/lxd/operations"
 	"github.com/canonical/lxd/lxd/project"
 	"github.com/canonical/lxd/lxd/project/limits"
-	"github.com/canonical/lxd/lxd/request"
 	"github.com/canonical/lxd/lxd/state"
 	storagePools "github.com/canonical/lxd/lxd/storage"
 	"github.com/canonical/lxd/lxd/task"
@@ -239,6 +239,42 @@ func instanceRebuildFromEmpty(ctx context.Context, inst instance.Instance, op *o
 	return nil
 }
 
+// adjustSnapRootDiskPool returns a clone of snapLocalDevices with the root-disk pool rewritten
+// to parentRootDiskPool when it diverges from the snapshot's expanded root disk pool.
+// parentRootDiskKey is used as the device name when a new local root device must be injected.
+// This is the canonical logic for aligning a snapshot's root disk with its new parent instance
+// before persisting; call it in both the copy path and any pre-flight validation.
+func adjustSnapRootDiskPool(snapLocalDevices deviceConfig.Devices, snapExpandedDevices deviceConfig.Devices, parentRootDiskKey, parentRootDiskPool string) deviceConfig.Devices {
+	result := snapLocalDevices.Clone()
+
+	snapRootKey, snapRootDev, err := api.GetRootDiskDevice(snapExpandedDevices.CloneNative())
+	if err == nil {
+		if snapRootDev["pool"] != parentRootDiskPool {
+			localRoot, found := result[snapRootKey]
+			if found {
+				localRoot["pool"] = parentRootDiskPool
+				result[snapRootKey] = localRoot
+			} else {
+				result[parentRootDiskKey] = deviceConfig.Device{
+					"type": "disk",
+					"path": "/",
+					"pool": parentRootDiskPool,
+				}
+			}
+		}
+	} else if errors.Is(err, api.ErrNoRootDisk) {
+		result[parentRootDiskKey] = deviceConfig.Device{
+			"type": "disk",
+			"path": "/",
+			"pool": parentRootDiskPool,
+		}
+	}
+	// If err is anything else (e.g. multiple root disks) leave result unmodified;
+	// instanceCreateAsCopy cannot safely fix that case either.
+
+	return result
+}
+
 // instanceCreateAsCopyOpts options for copying an instance.
 type instanceCreateAsCopyOpts struct {
 	sourceInstance           instance.Instance // Source instance.
@@ -365,41 +401,10 @@ func instanceCreateAsCopy(ctx context.Context, s *state.State, opts instanceCrea
 		}
 
 		for _, srcSnap := range snapshots {
-			snapLocalDevices := srcSnap.LocalDevices().Clone()
-
-			// Load snap root disk from expanded devices (in case it doesn't have its own root disk).
-			snapExpandedRootDiskDevKey, snapExpandedRootDiskDev, err := api.GetRootDiskDevice(srcSnap.ExpandedDevices().CloneNative())
-			if err == nil {
-				// If the expanded devices has a root disk, but its pool doesn't match our new
-				// parent instance's pool, then either modify the device if it is local or add a
-				// new one to local devices if its coming from the profiles.
-				if snapExpandedRootDiskDev["pool"] != instRootDiskDevice["pool"] {
-					localRootDiskDev, found := snapLocalDevices[snapExpandedRootDiskDevKey]
-					if found {
-						// Modify exist local device's pool.
-						localRootDiskDev["pool"] = instRootDiskDevice["pool"]
-						snapLocalDevices[snapExpandedRootDiskDevKey] = localRootDiskDev
-					} else {
-						// Add a new local device using parent instance's pool.
-						snapLocalDevices[instRootDiskDeviceKey] = map[string]string{
-							"type": "disk",
-							"path": "/",
-							"pool": instRootDiskDevice["pool"],
-						}
-					}
-				}
-			} else if errors.Is(err, api.ErrNoRootDisk) {
-				// If no root disk defined in either local devices or profiles, then add one to the
-				// snapshot local devices using the same device name from the parent instance.
-				snapLocalDevices[instRootDiskDeviceKey] = map[string]string{
-					"type": "disk",
-					"path": "/",
-					"pool": instRootDiskDevice["pool"],
-				}
-			} else { //nolint:staticcheck,revive // (keep the empty branch for the comment)
-				// Snapshot has multiple root disk devices, we can't automatically fix this so
-				// leave alone so we don't prevent copy.
-			}
+			snapLocalDevices := adjustSnapRootDiskPool(
+				srcSnap.LocalDevices(), srcSnap.ExpandedDevices(),
+				instRootDiskDeviceKey, instRootDiskDevice["pool"],
+			)
 
 			_, origSnapName, _ := strings.Cut(srcSnap.Name(), shared.SnapshotDelimiter)
 			newSnapName := inst.Name() + "/" + origSnapName
@@ -711,7 +716,7 @@ func pruneExpiredAndAutoCreateInstanceSnapshots(ctx context.Context, s *state.St
 
 		args := operations.OperationArgs{
 			Type:    operationtype.SnapshotsExpire,
-			Class:   operations.OperationClassTask,
+			Class:   operationtype.OperationClassTask,
 			RunHook: opRun,
 		}
 
@@ -737,7 +742,7 @@ func pruneExpiredAndAutoCreateInstanceSnapshots(ctx context.Context, s *state.St
 
 		args := operations.OperationArgs{
 			Type:    operationtype.SnapshotsCreateScheduled,
-			Class:   operations.OperationClassTask,
+			Class:   operationtype.OperationClassTask,
 			RunHook: opRun,
 		}
 
@@ -758,10 +763,12 @@ func pruneExpiredAndAutoCreateInstanceSnapshots(ctx context.Context, s *state.St
 	return nil
 }
 
-// resolveSourceImageFromCache searches the image to use for an instance source in the local cache and performs authorization checks.
+// resolveSourceImageFromCache searches the image to use for an instance source in the local cache.
 // This can be used to find either a cached copy of a remote image when a remote image is specified, or to find a local image when a local source image is specified.
 // If an image is not found locally, this function returns `nil` instead of an image and no error.
-func resolveSourceImageFromCache(r *http.Request, s *state.State, tx *db.ClusterTx, targetProjectName string, source api.InstanceSource, imageRef *string, instType string) (*api.Image, error) {
+// If an image is found, but is in a different project and is private, a function is returned to perform an authorization check on the image.
+// This must be called by the caller if non-nil.
+func resolveSourceImageFromCache(r *http.Request, s *state.State, tx *db.ClusterTx, targetProjectName string, source api.InstanceSource, imageRef *string, instType string) (*api.Image, func(ctx context.Context) error, error) {
 	// Resolve the project used for local cache lookup to find the image.
 	localLookupProject := targetProjectName
 	if source.Server == "" && source.Project != "" {
@@ -773,27 +780,25 @@ func resolveSourceImageFromCache(r *http.Request, s *state.State, tx *db.Cluster
 	// is different than the image not being found.
 	sourceImage, err := getSourceImageFromInstanceSource(r.Context(), s, tx, localLookupProject, source, imageRef, instType)
 	if err != nil && !api.StatusErrorCheck(err, http.StatusNotFound) {
-		return nil, err
+		return nil, nil, err
 	}
 
-	// If the image is locally available, private, and from a different project, check if the caller can view it.
+	// If the image is locally available, private, and from a different project, return an authorization checker function
+	// so that the caller can check access when the transaction has ended.
+	var authCheckFunc func(ctx context.Context) error
 	if sourceImage != nil && localLookupProject != targetProjectName && !sourceImage.Public {
 		// Get the effective image project based on the "features.images" value.
 		effectiveImageProject, err := project.ImageProject(r.Context(), tx.Tx(), localLookupProject)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 
-		// Create a child context and set effective project name to check the access permission.
-		ctx := context.WithValue(r.Context(), request.CtxEffectiveProjectName, effectiveImageProject)
-
-		err = s.Authorizer.CheckPermission(ctx, entity.ImageURL(localLookupProject, sourceImage.Fingerprint), auth.EntitlementCanView)
-		if err != nil {
-			return nil, err
+		authCheckFunc = func(ctx context.Context) error {
+			return s.Authorizer.CheckPermission(ctx, entity.ImageURL(effectiveImageProject, sourceImage.Fingerprint), auth.EntitlementCanView)
 		}
 	}
 
-	return sourceImage, nil
+	return sourceImage, authCheckFunc, nil
 }
 
 // getSourceImageFromInstanceSource returns the image to use for an instance source.

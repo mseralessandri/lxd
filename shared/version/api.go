@@ -99,7 +99,6 @@ var APIExtensions = []string{
 	"clustering",
 	"event_lifecycle",
 	"storage_api_remote_volume_handling",
-	"nvidia_runtime",
 	"container_mount_propagation",
 	"container_backup",
 	"devlxd_images",
@@ -119,7 +118,6 @@ var APIExtensions = []string{
 	"network_nat_order",
 	"container_full",
 	"backup_compression",
-	"nvidia_runtime_config",
 	"storage_api_volume_snapshots",
 	"storage_unmapped",
 	"projects",
@@ -499,6 +497,12 @@ var APIExtensions = []string{
 	"gpu_mig_cdi",
 	"cluster_links_unidirectional",
 	"network_load_balancer_pool_health_checks",
+	"operation_child_count",
+	"storage_driver_powerstore_nvme",
+	"access_management_expiry",
+	"cluster_links_public",
+	"durable_operations",
+	"access_management_bearer_pending",
 }
 
 // APIExtensionsCount returns the number of available API extensions.

@@ -668,6 +668,11 @@ test_basic_usage() {
   lxc list | grep c1 | grep RUNNING
   lxc list | grep c2 | grep RUNNING
 
+  # Test --all flag on project with no instances
+  lxc project create p1
+  lxc start --all --project p1
+  lxc project delete p1
+
   # Find the respective operation
   bulk_op="$(lxc query -X GET '/1.0/operations?recursion=2' | jq --exit-status '.. | objects | select(.description == "Updating the state of multiple instances")')"
 
@@ -828,6 +833,12 @@ test_basic_usage() {
   [ "$(lxc config get c1 image.os)" = "BusyBox" ]
   lxc rebuild c1 --empty
   [ "$(lxc config get c1 image.os || echo fail)" = "" ]
+  lxc delete c1
+
+  # Test that rebuild succeeds after a file operation.
+  lxc init testimage c1
+  lxc file create c1/foo
+  lxc rebuild testimage c1
   lxc delete c1
 
   # Test assigning an empty profile (with no root disk device) to an instance.

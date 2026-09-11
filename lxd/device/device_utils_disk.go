@@ -21,7 +21,6 @@ import (
 	"github.com/canonical/lxd/lxd/storage/filesystem"
 	"github.com/canonical/lxd/lxd/subprocess"
 	"github.com/canonical/lxd/shared"
-	"github.com/canonical/lxd/shared/osarch"
 	"github.com/canonical/lxd/shared/revert"
 )
 
@@ -242,17 +241,68 @@ func diskAddRootUserNSEntry(idmaps []idmap.IdmapEntry, hostRootID int64) []idmap
 	return idmaps
 }
 
-// DiskVMVirtiofsdStart starts a new virtiofsd process.
-// If the idmaps slice is supplied then the proxy process is run inside a user namespace using the supplied maps.
+// diskVMVirtiofsdResolveIDMaps returns explicit idmaps if provided, or the current namespace mappings otherwise.
+func diskVMVirtiofsdResolveIDMaps(idmaps []idmap.IdmapEntry, currentIdmapSetFunc func() (*idmap.IdmapSet, error)) ([]idmap.IdmapEntry, error) {
+	if len(idmaps) > 0 {
+		return idmaps, nil
+	}
+
+	if currentIdmapSetFunc == nil {
+		return nil, errors.New("Current idmap set function is nil")
+	}
+
+	currentIdmapSet, err := currentIdmapSetFunc()
+	if err != nil {
+		return nil, fmt.Errorf("Failed getting current idmap set: %w", err)
+	}
+
+	if currentIdmapSet == nil || len(currentIdmapSet.Idmap) == 0 {
+		return nil, errors.New("Current idmap set cannot be empty")
+	}
+
+	// The current idmap set maps IDs in the current namespace (Nsid) to IDs in its parent (Hostid).
+	// virtiofsd runs in a child namespace of the current one, so build an identity map over each
+	// current Nsid range (Hostid = Nsid) to pass the host's ID range through unchanged. Reusing the
+	// parent Hostid values directly would be incorrect when LXD itself is nested.
+	effectiveIDMaps := make([]idmap.IdmapEntry, 0, len(currentIdmapSet.Idmap))
+	hasUIDMap := false
+	hasGIDMap := false
+	for _, idmapEntry := range currentIdmapSet.Idmap {
+		effectiveIDMaps = append(effectiveIDMaps, idmap.IdmapEntry{
+			Hostid:   idmapEntry.Nsid,
+			Isuid:    idmapEntry.Isuid,
+			Isgid:    idmapEntry.Isgid,
+			Nsid:     idmapEntry.Nsid,
+			Maprange: idmapEntry.Maprange,
+		})
+
+		if idmapEntry.Isuid {
+			hasUIDMap = true
+		}
+
+		if idmapEntry.Isgid {
+			hasGIDMap = true
+		}
+	}
+
+	if !hasUIDMap || !hasGIDMap {
+		return nil, errors.New("Current idmap set must contain both UID and GID mappings")
+	}
+
+	return effectiveIDMaps, nil
+}
+
+// DiskVMVirtiofsdStart starts a new virtiofsd process with a socket present at the supplied path.
+// If the idmaps slice is empty, the current namespace mappings are used.
 // Returns UnsupportedError error if the host system or instance does not support virtiofsd, returns normal error
 // type if process cannot be started for other reasons.
-// Returns revert function and listener file handle on success.
-func DiskVMVirtiofsdStart(inst instance.Instance, socketPath string, pidPath string, logPath string, sharePath string, idmaps []idmap.IdmapEntry, threadPoolSize uint16) (func(), net.Listener, error) {
+// Returns a revert function on success.
+func DiskVMVirtiofsdStart(inst instance.Instance, socketPath string, pidPath string, logPath string, sharePath string, idmaps []idmap.IdmapEntry, threadPoolSize uint16) (func(), error) {
 	revert := revert.New()
 	defer revert.Fail()
 
 	if !filepath.IsAbs(sharePath) {
-		return nil, nil, fmt.Errorf("Share path not absolute: %q", sharePath)
+		return nil, fmt.Errorf("Share path not absolute: %q", sharePath)
 	}
 
 	// Remove old socket if needed.
@@ -271,27 +321,21 @@ func DiskVMVirtiofsdStart(inst instance.Instance, socketPath string, pidPath str
 	}
 
 	if cmd == "" {
-		return nil, nil, ErrMissingVirtiofsd
-	}
-
-	// Currently, virtiofs is broken on at least the ARM architecture.
-	// We therefore restrict virtiofs to 64BIT_INTEL_X86.
-	if inst.Architecture() != osarch.ARCH_64BIT_INTEL_X86 {
-		return nil, nil, UnsupportedError{msg: "Architecture unsupported"}
+		return nil, ErrMissingVirtiofsd
 	}
 
 	if shared.IsTrue(inst.ExpandedConfig()["migration.stateful"]) {
-		return nil, nil, UnsupportedError{"Stateful migration unsupported"}
+		return nil, UnsupportedError{"Stateful migration unsupported"}
 	}
 
 	if shared.IsTrue(inst.ExpandedConfig()["security.sev"]) || shared.IsTrue(inst.ExpandedConfig()["security.sev.policy.es"]) {
-		return nil, nil, UnsupportedError{"SEV unsupported"}
+		return nil, UnsupportedError{"SEV unsupported"}
 	}
 
 	// Trickery to handle paths > 108 chars.
 	socketFileDir, err := os.Open(filepath.Dir(socketPath))
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 
 	defer func() { _ = socketFileDir.Close() }()
@@ -300,7 +344,7 @@ func DiskVMVirtiofsdStart(inst instance.Instance, socketPath string, pidPath str
 
 	listener, err := net.Listen("unix", socketFile)
 	if err != nil {
-		return nil, nil, fmt.Errorf("Failed creating unix listener for virtiofsd: %w", err)
+		return nil, fmt.Errorf("Failed creating unix listener for virtiofsd: %w", err)
 	}
 
 	revert.Add(func() {
@@ -310,16 +354,18 @@ func DiskVMVirtiofsdStart(inst instance.Instance, socketPath string, pidPath str
 
 	unixListener, ok := listener.(*net.UnixListener)
 	if !ok {
-		return nil, nil, errors.New("Failed getting UnixListener for virtiofsd")
+		return nil, errors.New("Failed getting UnixListener for virtiofsd")
 	}
 
-	revert.Add(func() {
-		_ = unixListener.Close()
-	})
+	defer func() { _ = unixListener.Close() }()
+
+	// Don't unlink the socket file on close after virtiofsd has started.
+	// The socket should remain for qemu to connect to.
+	unixListener.SetUnlinkOnClose(false)
 
 	unixFile, err := unixListener.File()
 	if err != nil {
-		return nil, nil, fmt.Errorf("Failed getting unix listener file for virtiofsd: %w", err)
+		return nil, fmt.Errorf("Failed getting unix listener file for virtiofsd: %w", err)
 	}
 
 	defer func() { _ = unixFile.Close() }()
@@ -336,28 +382,41 @@ func DiskVMVirtiofsdStart(inst instance.Instance, socketPath string, pidPath str
 
 	proc, err := subprocess.NewProcess(cmd, args, logPath, logPath)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 
-	if len(idmaps) > 0 {
-		proc.SetUserns(&idmap.IdmapSet{Idmap: idmaps})
+	// This is required because virtiofsd is split into two long-running processes.
+	// The child calls `pivot_root(2)`, which sandboxes both processes inside `sharePath`.
+	// However, it only pivots the working directory of the parent process when it starts as `/`.
+	// Normally this would only prevent unmounting LXD's working directory, which is OK.
+	// But when we run virtiofsd from a non-initial user namespace, all existing mounts are
+	// brought into the sandbox as a single unit (see `mount_namespaces(7)`). These remain
+	// alive even after unmounting them on the host (MNT_LOCKED), which can prevent LXD from
+	// deactivating instance volumes.
+	proc.Dir = "/"
+
+	effectiveIDMaps, err := diskVMVirtiofsdResolveIDMaps(idmaps, idmap.CurrentIdmapSet)
+	if err != nil {
+		return nil, err
 	}
+
+	proc.SetUserns(&idmap.IdmapSet{Idmap: effectiveIDMaps}, true)
 
 	err = proc.StartWithFiles(context.Background(), []*os.File{unixFile})
 	if err != nil {
-		return nil, nil, fmt.Errorf("Failed starting virtiofsd: %w", err)
+		return nil, fmt.Errorf("Failed starting virtiofsd: %w", err)
 	}
 
 	revert.Add(func() { _ = proc.Stop() })
 
 	err = proc.Save(pidPath)
 	if err != nil {
-		return nil, nil, fmt.Errorf("Failed saving virtiofsd state: %w", err)
+		return nil, fmt.Errorf("Failed saving virtiofsd state: %w", err)
 	}
 
 	cleanup := revert.Clone().Fail
 	revert.Success()
-	return cleanup, listener, err
+	return cleanup, nil
 }
 
 // DiskVMVirtiofsdStop stops an existing virtiofsd process and cleans up.
